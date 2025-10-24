@@ -250,12 +250,22 @@ async def list_metrics() -> List[str]:
     """Retrieve a list of all metric names available in Prometheus.
     
     Returns:
-        List of metric names as strings
+        List of metric names as strings, filtered to exclude metrics with underscores
+        to reduce token consumption and focus on high-level metrics
     """
     logger.info("Listing available metrics")
     data = make_prometheus_request("label/__name__/values")
-    logger.info("Metrics list retrieved", metric_count=len(data))
-    return data
+    
+    # Filter out metrics with underscores to reduce token consumption
+    # Keep metrics like 'up', 'node:cpu:used:percent' but exclude 'http_requests_total'
+    filtered_metrics = [metric for metric in data if '_' not in metric]
+    
+    logger.info("Metrics list retrieved and filtered", 
+                total_metrics=len(data), 
+                filtered_metrics=len(filtered_metrics),
+                reduction_percentage=round((1 - len(filtered_metrics)/len(data)) * 100, 1) if data else 0)
+    
+    return filtered_metrics
 
 @mcp.tool(description="Get metadata for a specific metric")
 async def get_metric_metadata(metric: str) -> Dict[str, Any]:
@@ -308,7 +318,7 @@ async def get_metric_labels(metric: str) -> Dict[str, Any]:
     
     try:
         # Use the series API to get time series for this metric with limit for performance
-        # Limit to 1 series as we only need to discover label keys, not all possible values
+        # Limit to 1 series to minimize token consumption while still getting label structure
         params = {"match[]": metric, "limit": "1"}
         data = make_prometheus_request("series", params=params)
         logger.debug("Raw series response", data=data, metric=metric, limited=True)
@@ -327,34 +337,33 @@ async def get_metric_labels(metric: str) -> Dict[str, Any]:
                 "metric": metric,
                 "labels": {},
                 "series_count": 0,
+                "label_count": 0,
+                "limited": False,
                 "message": f"No time series found for metric '{metric}'. The metric may not exist or have no data."
             }
         
-        # Extract all unique labels and their values
-        labels_dict = {}
-        for series in data:
-            if isinstance(series, dict):
-                for label_name, label_value in series.items():
+        # Extract only the label keys (structure) from the first series
+        # We only need to know what labels exist, not their values
+        labels_result = {}
+        if data:
+            first_series = data[0]  # Only use the first series
+            if isinstance(first_series, dict):
+                for label_name, label_value in first_series.items():
                     # Skip the __name__ label as it's the metric name itself
                     if label_name != "__name__":
-                        if label_name not in labels_dict:
-                            labels_dict[label_name] = set()
-                        labels_dict[label_name].add(label_value)
+                        # Only store one example value from the single series
+                        labels_result[label_name] = [label_value]
         
-        # Convert sets to sorted lists for consistent output
-        labels_result = {}
-        for label_name, values_set in labels_dict.items():
-            labels_result[label_name] = sorted(list(values_set))
-        
-        # Check if we hit the limit (indicating there might be more series)
-        limited = len(data) >= 1
+        # Always indicate limited=True since we're using limit=1 for performance
+        limited = True
         
         result = {
             "metric": metric,
             "labels": labels_result,
             "series_count": len(data),
             "label_count": len(labels_result),
-            "limited": limited
+            "limited": limited,
+            "note": "Results limited to 1 series with single example value per label to minimize token usage"
         }
         
         logger.info("Metric labels retrieved", 
