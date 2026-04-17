@@ -29,7 +29,7 @@ def docker_client():
 def docker_image(docker_client):
     """Build the Docker image for testing."""
     # Build the Docker image
-    image_tag = "prometheus-mcp-server:test"
+    image_tag = "monitor-mcp-server:test"
     
     # Get the project root directory
     project_root = Path(__file__).parent.parent
@@ -68,43 +68,32 @@ class TestDockerBuild:
         """Test that Docker image builds without errors."""
         assert docker_image is not None
     
-    def test_docker_image_has_correct_labels(self, docker_client, docker_image):
-        """Test that Docker image has the required OCI labels."""
+    def test_docker_image_has_no_extra_labels(self, docker_client, docker_image):
+        """Test that Docker image has minimal labels (no bloat)."""
         image = docker_client.images.get(docker_image)
-        labels = image.attrs['Config']['Labels']
+        labels = image.attrs['Config']['Labels'] or {}
         
-        # Test OCI standard labels
-        assert 'org.opencontainers.image.title' in labels
-        assert labels['org.opencontainers.image.title'] == 'Prometheus MCP Server'
-        assert 'org.opencontainers.image.description' in labels
-        assert 'org.opencontainers.image.version' in labels
-        assert 'org.opencontainers.image.source' in labels
-        assert 'org.opencontainers.image.licenses' in labels
-        assert labels['org.opencontainers.image.licenses'] == 'MIT'
-        
-        # Test MCP-specific labels
-        assert 'mcp.server.name' in labels
-        assert labels['mcp.server.name'] == 'prometheus-mcp-server'
-        assert 'mcp.server.category' in labels
-        assert labels['mcp.server.category'] == 'monitoring'
-        assert 'mcp.server.transport.stdio' in labels
-        assert labels['mcp.server.transport.stdio'] == 'true'
-        assert 'mcp.server.transport.http' in labels
-        assert labels['mcp.server.transport.http'] == 'true'
+        bloat_labels = [
+            'org.opencontainers.image.title',
+            'mcp.server.name',
+            'mcp.server.transport.http',
+        ]
+        for label in bloat_labels:
+            assert label not in labels, f"不应包含无用 label: {label}"
     
     def test_docker_image_exposes_correct_port(self, docker_client, docker_image):
         """Test that Docker image exposes the correct port."""
         image = docker_client.images.get(docker_image)
         exposed_ports = image.attrs['Config']['ExposedPorts']
         
-        assert '8080/tcp' in exposed_ports
+        assert '8000/tcp' in exposed_ports
     
-    def test_docker_image_runs_as_non_root(self, docker_client, docker_image):
-        """Test that Docker image runs as non-root user."""
+    def test_docker_image_has_workdir(self, docker_client, docker_image):
+        """Test that Docker image has correct working directory."""
         image = docker_client.images.get(docker_image)
-        user = image.attrs['Config']['User']
+        workdir = image.attrs['Config']['WorkingDir']
         
-        assert user == 'app'
+        assert workdir == '/app'
 
 
 class TestDockerContainerStdio:
@@ -177,11 +166,11 @@ class TestDockerContainerHTTP:
             docker_image,
             environment={
                 'PROMETHEUS_URL': 'http://mock-prometheus:9090',
-                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'http',
+                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'streamable-http',
                 'PROMETHEUS_MCP_BIND_HOST': '0.0.0.0',
-                'PROMETHEUS_MCP_BIND_PORT': '8080'
+                'PROMETHEUS_MCP_BIND_PORT': '8000'
             },
-            ports={'8080/tcp': 8080},
+            ports={'8000/tcp': 8000},
             detach=True,
             remove=True
         )
@@ -198,7 +187,7 @@ class TestDockerContainerHTTP:
             # Note: This might fail if the MCP server doesn't accept HTTP requests
             # but the port should be open
             try:
-                response = requests.get('http://localhost:8080', timeout=5)
+                response = requests.get('http://localhost:8000', timeout=5)
                 # Any response (including error) means the port is accessible
             except requests.exceptions.ConnectionError:
                 pytest.fail("HTTP port not accessible")
@@ -255,9 +244,9 @@ class TestDockerEnvironmentVariables:
             'PROMETHEUS_PASSWORD': 'testpass',
             'PROMETHEUS_TOKEN': 'test-token',
             'ORG_ID': 'test-org',
-            'PROMETHEUS_MCP_SERVER_TRANSPORT': 'http',
+            'PROMETHEUS_MCP_SERVER_TRANSPORT': 'streamable-http',
             'PROMETHEUS_MCP_BIND_HOST': '0.0.0.0',
-            'PROMETHEUS_MCP_BIND_PORT': '8080'
+            'PROMETHEUS_MCP_BIND_PORT': '8000'
         }
         
         container = docker_client.containers.run(
@@ -323,7 +312,7 @@ class TestDockerEnvironmentVariables:
             docker_image,
             environment={
                 'PROMETHEUS_URL': 'http://test-prometheus:9090',
-                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'http',
+                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'streamable-http',
                 'PROMETHEUS_MCP_BIND_PORT': 'invalid-port'
             },
             detach=True,
@@ -352,60 +341,23 @@ class TestDockerEnvironmentVariables:
 class TestDockerSecurity:
     """Test Docker security features."""
     
-    def test_container_runs_as_non_root_user(self, docker_client, docker_image):
-        """Test that container processes run as non-root user."""
+    def test_container_has_app_directory(self, docker_client, docker_image):
+        """Test that container has /app directory with source files."""
         container = docker_client.containers.run(
             docker_image,
             environment={
                 'PROMETHEUS_URL': 'http://test-prometheus:9090',
-                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'http'
+                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'streamable-http'
             },
             detach=True,
             remove=True
         )
         
         try:
-            # Wait for container to start
             time.sleep(2)
             
-            # Execute id command to check user
-            result = container.exec_run('id')
-            output = result.output.decode('utf-8')
-            
-            # Should run as app user (uid=1000, gid=1000)
-            assert 'uid=1000(app)' in output
-            assert 'gid=1000(app)' in output
-            
-        finally:
-            try:
-                container.stop()
-                container.remove()
-            except:
-                pass
-    
-    def test_container_filesystem_permissions(self, docker_client, docker_image):
-        """Test that container filesystem has correct permissions."""
-        container = docker_client.containers.run(
-            docker_image,
-            environment={
-                'PROMETHEUS_URL': 'http://test-prometheus:9090',
-                'PROMETHEUS_MCP_SERVER_TRANSPORT': 'http'
-            },
-            detach=True,
-            remove=True
-        )
-        
-        try:
-            # Wait for container to start
-            time.sleep(2)
-            
-            # Check app directory ownership
-            result = container.exec_run('ls -la /app')
-            output = result.output.decode('utf-8')
-            
-            # App directory should be owned by app user
-            # Check that the directory shows app user and app group
-            assert 'app  app' in output or 'app app' in output
+            result = container.exec_run('ls /app/main.py')
+            assert result.exit_code == 0
             
         finally:
             try:

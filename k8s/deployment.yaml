@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitor-mcp-server
+  labels:
+    app.kubernetes.io/name: monitor-mcp-server
+    app.kubernetes.io/component: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: monitor-mcp-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monitor-mcp-server
+        app.kubernetes.io/component: mcp
+    spec:
+      containers:
+        - name: monitor-mcp
+          image: monitor-mcp-server:latest
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://thanos-query.monitoring:9090"
+            - name: PROMETHEUS_MCP_SERVER_TRANSPORT
+              value: "streamable-http"
+            - name: PROMETHEUS_MCP_BIND_HOST
+              value: "0.0.0.0"
+            - name: RULER_URL
+              value: "http://thanos-ruler.monitoring:9090"
+            - name: PROMETHEUS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: monitor-mcp-secret
+                  key: token
+                  optional: true
+            - name: PROMETHEUS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: monitor-mcp-secret
+                  key: username
+                  optional: true
+            - name: PROMETHEUS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: monitor-mcp-secret
+                  key: password
+                  optional: true
+            - name: ORG_ID
+              valueFrom:
+                secretKeyRef:
+                  name: monitor-mcp-secret
+                  key: org-id
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          startupProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12   # 最多等待 60s 首次就绪
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false

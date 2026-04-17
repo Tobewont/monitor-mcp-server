@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 import structlog
 
-from prometheus_mcp_server.logging_config import setup_logging, get_logger
+from monitor_mcp_server.logging_config import setup_logging, get_logger
 
 
 def test_setup_logging_returns_logger():

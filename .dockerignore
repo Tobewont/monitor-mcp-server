@@ -3,16 +3,13 @@
 .gitignore
 .github
 
-# CI
-.codeclimate.yml
-.travis.yml
-.taskcluster.yml
-
 # Docker
 docker-compose.yml
 .docker
+Dockerfile
+.dockerignore
 
-# Byte-compiled / optimized / DLL files
+# Python
 **/__pycache__/
 **/*.py[cod]
 **/*$py.class
@@ -20,25 +17,27 @@ docker-compose.yml
 **/.pytest_cache
 **/.coverage
 **/htmlcov
+*.egg-info
 
-# Virtual environment
+# Environment
 .env
-.venv/
-venv/
-ENV/
 
 # IDE
+.cursor
 .idea
 .vscode
 
-# macOS
+# Tests & docs & deployment (not needed at runtime)
+tests/
+skills/
+docs/
+k8s/
+openspec/
+LICENSE
+README_EN.md
+CHANGELOG.md
+env.example
+
+# OS
 .DS_Store
-
-# Windows
 Thumbs.db
-
-# Config
-.env
-
-# Distribution / packaging
-*.egg-info/

@@ -1,532 +1,369 @@
-"""Tests for MCP protocol compliance and tool functionality."""
+"""Tests for MCP protocol compliance — validates real tool implementations."""
 
 import pytest
 import json
-import asyncio
-from unittest.mock import patch, MagicMock, AsyncMock
-from datetime import datetime
-from prometheus_mcp_server import server
-from prometheus_mcp_server.server import (
-    make_prometheus_request, get_prometheus_auth, config, TransportType,
-    execute_query, execute_range_query, list_metrics, get_metric_metadata, get_metric_labels, get_targets, health_check
+from unittest.mock import patch, MagicMock
+from fastmcp import Client
+from monitor_mcp_server.client import get_prometheus_auth
+from monitor_mcp_server.config import config, TransportType, MCPServerConfig, PrometheusConfig
+from monitor_mcp_server.tools import (
+    mcp, execute_query, execute_range_query, list_metrics,
+    get_metric_metadata, get_metric_labels, get_targets, health_check,
+    get_label_values, get_alerts, get_rules,
 )
 
-# Test the MCP tools by testing them through async wrappers
-async def execute_query_wrapper(query: str, time=None):
-    """Wrapper to test execute_query functionality."""
-    params = {"query": query}
-    if time:
-        params["time"] = time
-    data = make_prometheus_request("query", params=params)
-    return {"resultType": data["resultType"], "result": data["result"]}
-
-async def execute_range_query_wrapper(query: str, start: str, end: str, step: str):
-    """Wrapper to test execute_range_query functionality."""  
-    params = {"query": query, "start": start, "end": end, "step": step}
-    data = make_prometheus_request("query_range", params=params)
-    return {"resultType": data["resultType"], "result": data["result"]}
-
-async def list_metrics_wrapper():
-    """Wrapper to test list_metrics functionality."""
-    return make_prometheus_request("label/__name__/values")
-
-async def get_metric_metadata_wrapper(metric: str):
-    """Wrapper to test get_metric_metadata functionality."""
-    params = {"metric": metric}
-    data = make_prometheus_request("metadata", params=params)
-    return data["data"][metric]
-
-async def get_metric_labels_wrapper(metric: str):
-    """Wrapper to test get_metric_labels functionality."""
-    return await get_metric_labels(metric)
-
-async def get_targets_wrapper():
-    """Wrapper to test get_targets functionality."""
-    data = make_prometheus_request("targets")
-    return {"activeTargets": data["activeTargets"], "droppedTargets": data["droppedTargets"]}
-
-async def health_check_wrapper():
-    """Wrapper to test health_check functionality."""
-    try:
-        health_status = {
-            "status": "healthy",
-            "service": "prometheus-mcp-server", 
-            "version": "1.2.3",
-            "timestamp": datetime.utcnow().isoformat(),
-            "transport": config.mcp_server_config.mcp_server_transport if config.mcp_server_config else "stdio",
-            "configuration": {
-                "prometheus_url_configured": bool(config.url),
-                "authentication_configured": bool(config.username or config.token),
-                "org_id_configured": bool(config.org_id)
-            }
-        }
-        
-        if config.url:
-            try:
-                make_prometheus_request("query", params={"query": "up", "time": str(int(datetime.utcnow().timestamp()))})
-                health_status["prometheus_connectivity"] = "healthy"
-                health_status["prometheus_url"] = config.url
-            except Exception as e:
-                health_status["prometheus_connectivity"] = "unhealthy"
-                health_status["prometheus_error"] = str(e)
-                health_status["status"] = "degraded"
-        else:
-            health_status["status"] = "unhealthy"
-            health_status["error"] = "PROMETHEUS_URL not configured"
-        
-        return health_status
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "service": "prometheus-mcp-server",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
 
 @pytest.fixture
-def mock_prometheus_response():
-    """Mock successful Prometheus API response."""
-    return {
-        "status": "success",
-        "data": {
-            "resultType": "vector",
-            "result": [
-                {
-                    "metric": {"__name__": "up", "instance": "localhost:9090"},
-                    "value": [1609459200, "1"]
-                }
-            ]
-        }
-    }
+def mock_make_request():
+    with patch("monitor_mcp_server.tools.make_prometheus_request") as mock:
+        yield mock
 
 
-@pytest.fixture
-def mock_metrics_response():
-    """Mock Prometheus metrics list response."""
-    return {
-        "status": "success", 
-        "data": ["up", "prometheus_build_info", "prometheus_config_last_reload_successful"]
-    }
-
-
-@pytest.fixture
-def mock_metadata_response():
-    """Mock Prometheus metadata response."""
-    return {
-        "status": "success",
-        "data": {
-            "data": {
-                "up": [
-                    {
-                        "type": "gauge",
-                        "help": "1 if the instance is healthy, 0 otherwise",
-                        "unit": ""
-                    }
-                ]
-            }
-        }
-    }
-
-
-@pytest.fixture
-def mock_targets_response():
-    """Mock Prometheus targets response."""
-    return {
-        "status": "success",
-        "data": {
-            "activeTargets": [
-                {
-                    "discoveredLabels": {"__address__": "localhost:9090"},
-                    "labels": {"instance": "localhost:9090", "job": "prometheus"},
-                    "scrapePool": "prometheus",
-                    "scrapeUrl": "http://localhost:9090/metrics",
-                    "lastError": "",
-                    "lastScrape": "2023-01-01T00:00:00Z",
-                    "lastScrapeDuration": 0.001,
-                    "health": "up"
-                }
-            ],
-            "droppedTargets": []
-        }
-    }
-
+# ---------------------------------------------------------------------------
+# Tool signature & return structure
+# ---------------------------------------------------------------------------
 
 class TestMCPToolCompliance:
-    """Test MCP tool interface compliance."""
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio  
-    async def test_execute_query_tool_signature(self, mock_request, mock_prometheus_response):
-        """Test execute_query tool has correct MCP signature."""
-        mock_request.return_value = mock_prometheus_response["data"]
-        
-        # Ensure config has a URL set for tests
-        original_url = config.url
-        if not config.url:
-            config.url = "http://test-prometheus:9090"
-            
-        try:
-            # Test required parameters
-            result = await execute_query_wrapper("up")
-            assert isinstance(result, dict)
-            assert "resultType" in result
-            assert "result" in result
-            
-            # Test optional parameters
-            result = await execute_query_wrapper("up", time="2023-01-01T00:00:00Z")
-            assert isinstance(result, dict)
-        finally:
-            config.url = original_url
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_execute_range_query_tool_signature(self, mock_request, mock_prometheus_response):
-        """Test execute_range_query tool has correct MCP signature."""
-        mock_request.return_value = mock_prometheus_response["data"]
-        
-        # Test all required parameters
-        result = await execute_range_query_wrapper(
-            query="up",
-            start="2023-01-01T00:00:00Z", 
-            end="2023-01-01T01:00:00Z",
-            step="1m"
-        )
-        assert isinstance(result, dict)
-        assert "resultType" in result
-        assert "result" in result
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_list_metrics_tool_signature(self, mock_request, mock_metrics_response):
-        """Test list_metrics tool has correct MCP signature."""
-        mock_request.return_value = mock_metrics_response["data"]
-        
-        result = await list_metrics_wrapper()
-        assert isinstance(result, list)
-        assert all(isinstance(metric, str) for metric in result)
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_get_metric_metadata_tool_signature(self, mock_request, mock_metadata_response):
-        """Test get_metric_metadata tool has correct MCP signature."""
-        mock_request.return_value = mock_metadata_response["data"]
-        
-        result = await get_metric_metadata_wrapper("up")
-        assert isinstance(result, list)
-        assert all(isinstance(metadata, dict) for metadata in result)
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_get_targets_tool_signature(self, mock_request, mock_targets_response):
-        """Test get_targets tool has correct MCP signature."""
-        mock_request.return_value = mock_targets_response["data"]
-        
-        result = await get_targets_wrapper()
-        assert isinstance(result, dict)
-        assert "activeTargets" in result
-        assert "droppedTargets" in result
-        assert isinstance(result["activeTargets"], list)
-        assert isinstance(result["droppedTargets"], list)
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_health_check_tool_signature(self, mock_request):
-        """Test health_check tool has correct MCP signature."""
-        # Mock successful Prometheus connectivity
-        mock_request.return_value = {"resultType": "vector", "result": []}
-        
-        result = await health_check_wrapper()
-        assert isinstance(result, dict)
-        assert "status" in result
-        assert "service" in result
-        assert "timestamp" in result
-        assert result["service"] == "prometheus-mcp-server"
 
+    @pytest.mark.asyncio
+    async def test_execute_query_returns_correct_structure(self, mock_make_request):
+        mock_make_request.return_value = {
+            "resultType": "vector",
+            "result": [{"metric": {"__name__": "up"}, "value": [1609459200, "1"]}]
+        }
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_query", {"query": "up"})
+        assert result.data["resultType"] == "vector"
+        assert len(result.data["result"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_execute_query_with_time(self, mock_make_request):
+        mock_make_request.return_value = {"resultType": "vector", "result": []}
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_query", {"query": "up", "time": "2023-01-01T00:00:00Z"})
+        mock_make_request.assert_called_once_with("query", params={"query": "up", "time": "2023-01-01T00:00:00Z"})
+        assert result.data["resultType"] == "vector"
+
+    @pytest.mark.asyncio
+    async def test_execute_range_query_returns_correct_structure(self, mock_make_request):
+        mock_make_request.return_value = {"resultType": "matrix", "result": []}
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_range_query", {
+                "query": "up", "start": "2023-01-01T00:00:00Z",
+                "end": "2023-01-01T01:00:00Z", "step": "1m"
+            })
+        assert result.data["resultType"] == "matrix"
+
+    @pytest.mark.asyncio
+    async def test_list_metrics_returns_paginated(self, mock_make_request):
+        mock_make_request.return_value = ["up", "go_goroutines", "http_requests_total"]
+        async with Client(mcp) as client:
+            result = await client.call_tool("list_metrics", {})
+        data = json.loads(result.content[0].text)
+        assert data["total"] == 3
+        assert isinstance(data["metrics"], list)
+
+    @pytest.mark.asyncio
+    async def test_get_targets_returns_correct_structure(self, mock_make_request):
+        mock_make_request.return_value = {
+            "activeTargets": [{"health": "up", "labels": {"job": "prometheus"}}],
+            "droppedTargets": []
+        }
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_targets", {})
+        data = json.loads(result.content[0].text)
+        assert "activeTargets" in data
+        assert "droppedTargets" in data
+
+    @pytest.mark.asyncio
+    async def test_health_check_returns_correct_structure(self, mock_make_request):
+        mock_make_request.return_value = {"resultType": "vector", "result": []}
+        async with Client(mcp) as client:
+            result = await client.call_tool("health_check", {})
+        data = json.loads(result.content[0].text)
+        assert "status" in data
+        assert "timestamp" in data
+        assert "prometheus" in data
+        assert data["prometheus"]["connectivity"] == "healthy"
+        for field in ("service", "version", "transport", "configuration"):
+            assert field not in data
+
+    @pytest.mark.asyncio
+    async def test_health_check_target_ruler_with_dedicated_url(self, mock_make_request):
+        mock_make_request.return_value = {"alerts": []}
+        original_ruler = config.ruler_url
+        config.ruler_url = "http://ruler:9090"
+        try:
+            async with Client(mcp) as client:
+                result = await client.call_tool("health_check", {"target": "ruler"})
+            data = json.loads(result.content[0].text)
+            assert data["status"] == "healthy"
+            assert "ruler" in data
+            assert data["ruler"]["connectivity"] == "healthy"
+            assert data["ruler"]["dedicated"] is True
+            assert "prometheus" not in data
+            # A5: Ruler 探活改用 /alerts（比 /rules 轻量很多）
+            mock_make_request.assert_called_once_with("alerts", base_url="http://ruler:9090")
+        finally:
+            config.ruler_url = original_ruler
+
+    @pytest.mark.asyncio
+    async def test_health_check_target_prometheus_only(self, mock_make_request):
+        mock_make_request.return_value = {"resultType": "vector", "result": []}
+        async with Client(mcp) as client:
+            result = await client.call_tool("health_check", {"target": "prometheus"})
+        data = json.loads(result.content[0].text)
+        assert data["status"] == "healthy"
+        assert "prometheus" in data
+        assert "ruler" not in data
+
+    @pytest.mark.asyncio
+    async def test_get_metric_metadata_returns_dict(self, mock_make_request):
+        mock_make_request.return_value = {
+            "up": [{"type": "gauge", "help": "Up status", "unit": ""}]
+        }
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_metric_metadata", {"metric": "up"})
+        data = json.loads(result.content[0].text)
+        assert isinstance(data, dict)
+        assert "up" in data
+
+    @pytest.mark.asyncio
+    async def test_get_label_values_returns_correct_structure(self, mock_make_request):
+        mock_make_request.return_value = ["prometheus", "node-exporter"]
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_label_values", {"label": "job"})
+        data = json.loads(result.content[0].text)
+        assert data["label"] == "job"
+        assert data["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_get_label_values_invalid_name(self, mock_make_request):
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_label_values", {"label": "invalid-label!"})
+        data = json.loads(result.content[0].text)
+        assert "error" in data
+        assert data["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
 
 class TestMCPToolErrorHandling:
-    """Test MCP tool error handling compliance."""
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
+
     @pytest.mark.asyncio
-    async def test_execute_query_handles_prometheus_errors(self, mock_request):
-        """Test execute_query handles Prometheus API errors gracefully."""
-        mock_request.side_effect = ValueError("Prometheus API error: query timeout")
-        
-        with pytest.raises(ValueError):
-            await execute_query_wrapper("invalid_query{")
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
+    async def test_health_check_degraded_on_prometheus_failure(self, mock_make_request):
+        mock_make_request.side_effect = Exception("Connection timeout")
+        async with Client(mcp) as client:
+            result = await client.call_tool("health_check", {"target": "prometheus"})
+        data = json.loads(result.content[0].text)
+        assert data["status"] == "degraded"
+        assert data["prometheus"]["connectivity"] == "unhealthy"
+
     @pytest.mark.asyncio
-    async def test_execute_range_query_handles_network_errors(self, mock_request):
-        """Test execute_range_query handles network errors gracefully."""
-        import requests
-        mock_request.side_effect = requests.exceptions.ConnectionError("Connection refused")
-        
-        with pytest.raises(requests.exceptions.ConnectionError):
-            await execute_range_query_wrapper("up", "now-1h", "now", "1m")
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
+    async def test_health_check_degraded_on_ruler_failure(self, mock_make_request):
+        mock_make_request.side_effect = Exception("Ruler unreachable")
+        original_ruler = config.ruler_url
+        config.ruler_url = "http://ruler:9090"
+        try:
+            async with Client(mcp) as client:
+                result = await client.call_tool("health_check", {"target": "ruler"})
+            data = json.loads(result.content[0].text)
+            assert data["status"] == "degraded"
+            assert data["ruler"]["connectivity"] == "unhealthy"
+            assert "Ruler unreachable" in data["ruler"]["error"]
+        finally:
+            config.ruler_url = original_ruler
+
     @pytest.mark.asyncio
-    async def test_health_check_handles_configuration_errors(self, mock_request):
-        """Test health_check handles configuration errors gracefully."""
-        # Test with missing Prometheus URL
+    async def test_health_check_unhealthy_without_url(self, mock_make_request):
         original_url = config.url
         config.url = ""
-        
         try:
-            result = await health_check_wrapper()
-            assert result["status"] == "unhealthy" 
-            assert "error" in result or "PROMETHEUS_URL" in str(result)
+            async with Client(mcp) as client:
+                result = await client.call_tool("health_check", {"target": "prometheus"})
+            data = json.loads(result.content[0].text)
+            assert data["status"] == "unhealthy"
+            assert data["prometheus"]["connectivity"] == "unhealthy"
         finally:
             config.url = original_url
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_health_check_handles_connectivity_errors(self, mock_request):
-        """Test health_check handles Prometheus connectivity errors."""
-        mock_request.side_effect = Exception("Connection timeout")
-        
-        result = await health_check_wrapper()
-        assert result["status"] in ["unhealthy", "degraded"]
-        assert "prometheus_connectivity" in result or "error" in result
 
+    @pytest.mark.asyncio
+    async def test_health_check_invalid_target(self, mock_make_request):
+        async with Client(mcp) as client:
+            result = await client.call_tool("health_check", {"target": "invalid"})
+        data = json.loads(result.content[0].text)
+        assert data["status"] == "error"
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_get_metric_metadata_error_handling(self, mock_make_request):
+        mock_make_request.side_effect = Exception("Connection refused")
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_metric_metadata", {"metric": "up"})
+        data = json.loads(result.content[0].text)
+        assert "error" in data
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_get_metric_metadata_non_dict_response(self, mock_make_request):
+        mock_make_request.return_value = "unexpected string"
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_metric_metadata", {"metric": "up"})
+        data = json.loads(result.content[0].text)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_get_metric_labels_non_list_response(self, mock_make_request):
+        mock_make_request.return_value = "not a list"
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_metric_labels", {"metric": "up"})
+        data = json.loads(result.content[0].text)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_get_label_values_error_handling(self, mock_make_request):
+        mock_make_request.side_effect = Exception("Connection refused")
+        async with Client(mcp) as client:
+            result = await client.call_tool("get_label_values", {"label": "job"})
+        data = json.loads(result.content[0].text)
+        assert "error" in data
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_get_alerts_with_ruler_url(self, mock_make_request):
+        mock_make_request.return_value = {"alerts": [{"state": "firing", "labels": {"alertname": "Test"}}]}
+        original_ruler = config.ruler_url
+        config.ruler_url = "http://ruler:9090"
+        try:
+            async with Client(mcp) as client:
+                result = await client.call_tool("get_alerts", {})
+            mock_make_request.assert_called_once_with("alerts", base_url="http://ruler:9090")
+            data = json.loads(result.content[0].text)
+            assert data["firing"] == 1
+        finally:
+            config.ruler_url = original_ruler
+
+    @pytest.mark.asyncio
+    async def test_get_rules_with_ruler_url(self, mock_make_request):
+        mock_make_request.return_value = {"groups": [{"name": "g1", "rules": [{"name": "r1"}]}]}
+        original_ruler = config.ruler_url
+        config.ruler_url = "http://ruler:9090"
+        try:
+            async with Client(mcp) as client:
+                result = await client.call_tool("get_rules", {})
+            mock_make_request.assert_called_once_with("rules", base_url="http://ruler:9090")
+            data = json.loads(result.content[0].text)
+            assert data["total_rules"] == 1
+        finally:
+            config.ruler_url = original_ruler
+
+
+# ---------------------------------------------------------------------------
+# Data format compliance
+# ---------------------------------------------------------------------------
 
 class TestMCPDataFormats:
-    """Test MCP tool data format compliance."""
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_execute_query_returns_valid_json(self, mock_request, mock_prometheus_response):
-        """Test execute_query returns JSON-serializable data."""
-        mock_request.return_value = mock_prometheus_response["data"]
-        
-        result = await execute_query_wrapper("up")
-        
-        # Verify JSON serializability
-        json_str = json.dumps(result)
-        assert json_str is not None
-        
-        # Verify structure
-        parsed = json.loads(json_str)
-        assert "resultType" in parsed
-        assert "result" in parsed
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_all_tools_return_json_serializable_data(self, mock_request):
-        """Test all MCP tools return JSON-serializable data."""
-        # Setup various mock responses
-        mock_request.side_effect = [
-            {"resultType": "vector", "result": []},  # execute_query
-            {"resultType": "matrix", "result": []},  # execute_range_query
-            ["metric1", "metric2"],  # list_metrics
-            {"metric1": [{"type": "gauge", "help": "test"}]},  # get_metric_metadata
-            [{"__name__": "test_metric", "job": "test", "instance": "localhost"}],  # get_metric_labels
-            {"activeTargets": [], "droppedTargets": []},  # get_targets
-        ]
-        
-        # Test all tools
-        tools_and_calls = [
-            (execute_query_wrapper, ("up",)),
-            (execute_range_query_wrapper, ("up", "now-1h", "now", "1m")),
-            (list_metrics_wrapper, ()),
-            (get_metric_metadata_wrapper, ("metric1",)),
-            (get_metric_labels_wrapper, ("test_metric",)),
-            (get_targets_wrapper, ()),
-        ]
-        
-        for tool, args in tools_and_calls:
-            result = await tool(*args)
-            
-            # Verify JSON serializability
-            try:
-                json_str = json.dumps(result)
-                assert json_str is not None
-            except (TypeError, ValueError) as e:
-                pytest.fail(f"Tool {tool.__name__} returned non-JSON-serializable data: {e}")
 
+    @pytest.mark.asyncio
+    async def test_all_tools_return_json_serializable(self, mock_make_request):
+        mock_make_request.side_effect = [
+            {"resultType": "vector", "result": []},
+            {"resultType": "matrix", "result": []},
+            ["metric1", "metric2"],
+            {"up": [{"type": "gauge", "help": "test"}]},
+            [{"__name__": "m", "job": "test"}],
+            ["prometheus"],
+            {"alerts": []},
+            {"groups": []},
+            {"activeTargets": [], "droppedTargets": []},
+        ]
+        tool_calls = [
+            ("execute_query", {"query": "up"}),
+            ("execute_range_query", {"query": "up", "start": "now-1h", "end": "now", "step": "1m"}),
+            ("list_metrics", {}),
+            ("get_metric_metadata", {"metric": "up"}),
+            ("get_metric_labels", {"metric": "m"}),
+            ("get_label_values", {"label": "job"}),
+            ("get_alerts", {}),
+            ("get_rules", {}),
+            ("get_targets", {}),
+        ]
+        async with Client(mcp) as client:
+            for tool_name, args in tool_calls:
+                result = await client.call_tool(tool_name, args)
+                text = result.content[0].text
+                try:
+                    json.loads(text)
+                except (TypeError, ValueError) as e:
+                    pytest.fail(f"Tool {tool_name} returned non-JSON-serializable data: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Server configuration
+# ---------------------------------------------------------------------------
 
 class TestMCPServerConfiguration:
-    """Test MCP server configuration compliance."""
-    
+
     def test_transport_type_validation(self):
-        """Test transport type validation works correctly."""
-        # Valid transport types
-        valid_transports = ["stdio", "http", "sse"]
-        for transport in valid_transports:
-            assert transport in TransportType.values()
-        
-        # Invalid transport types should not be in values
-        invalid_transports = ["tcp", "websocket", "grpc"]
-        for transport in invalid_transports:
-            assert transport not in TransportType.values()
-    
+        valid = ["stdio", "sse", "streamable-http"]
+        for t in valid:
+            assert t in TransportType.values()
+        for t in ["http", "tcp", "websocket"]:
+            assert t not in TransportType.values()
+
     def test_server_config_validation(self):
-        """Test server configuration validation."""
-        from prometheus_mcp_server.server import MCPServerConfig, PrometheusConfig
-        
-        # Valid configuration
-        mcp_config = MCPServerConfig(
-            mcp_server_transport="http",
-            mcp_bind_host="127.0.0.1", 
-            mcp_bind_port=8080
-        )
-        assert mcp_config.mcp_server_transport == "http"
-        
-        # Test Prometheus config
-        prometheus_config = PrometheusConfig(
-            url="http://prometheus:9090",
-            mcp_server_config=mcp_config
-        )
-        assert prometheus_config.url == "http://prometheus:9090"
-    
+        cfg = MCPServerConfig(mcp_server_transport="sse", mcp_bind_host="127.0.0.1", mcp_bind_port=8000)
+        assert cfg.mcp_server_transport == "sse"
+
+    def test_stdio_config_allows_empty_host_port(self):
+        cfg = MCPServerConfig(mcp_server_transport="stdio", mcp_bind_host=None, mcp_bind_port=None)
+        assert cfg.mcp_server_transport == "stdio"
+
     def test_authentication_configuration(self):
-        """Test authentication configuration options."""
-        from prometheus_mcp_server.server import get_prometheus_auth
-        
-        # Test with no authentication
-        original_config = {
-            'username': config.username,
-            'password': config.password, 
-            'token': config.token
-        }
-        
+        orig = (config.username, config.password, config.token)
         try:
-            config.username = ""
-            config.password = ""
-            config.token = ""
-            
-            auth = get_prometheus_auth()
-            assert auth is None
-            
-            # Test with basic auth
-            config.username = "testuser"
-            config.password = "testpass"
-            config.token = ""
-            
-            auth = get_prometheus_auth()
-            assert auth is not None
-            
-            # Test with token auth (should take precedence)
-            config.token = "test-token"
-            
-            auth = get_prometheus_auth()
-            assert auth is not None
-            assert "Authorization" in auth
-            assert "Bearer" in auth["Authorization"]
-            
+            config.username = config.password = config.token = None
+            h, a = get_prometheus_auth()
+            assert h == {} and a is None
+
+            config.username, config.password = "u", "p"
+            h, a = get_prometheus_auth()
+            assert a == ("u", "p")
+
+            config.token = "tok"
+            h, a = get_prometheus_auth()
+            assert h["Authorization"] == "Bearer tok" and a is None
         finally:
-            # Restore original config
-            config.username = original_config['username']
-            config.password = original_config['password']
-            config.token = original_config['token']
+            config.username, config.password, config.token = orig
 
-
-class TestMCPProtocolVersioning:
-    """Test MCP protocol versioning and capabilities."""
-    
-    def test_mcp_server_info(self):
-        """Test MCP server provides correct server information."""
-        # Test FastMCP server instantiation
-        from prometheus_mcp_server.server import mcp
-        
-        assert mcp is not None
-        # FastMCP should have a name
-        assert hasattr(mcp, 'name') or hasattr(mcp, '_name')
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_tool_descriptions_are_present(self, mock_request):
-        """Test that all MCP tools have proper descriptions."""
-        # All tools should be registered with descriptions
-        tools = [
-            execute_query,
-            execute_range_query,
-            list_metrics,
-            get_metric_metadata,
-            get_metric_labels,
-            get_targets,
-            health_check
-        ]
-        
+    def test_tool_descriptions_are_present(self):
+        tools = [execute_query, execute_range_query, list_metrics,
+                 get_metric_metadata, get_metric_labels, get_label_values,
+                 get_targets, health_check, get_alerts, get_rules]
         for tool in tools:
-            # Each tool should have a description (FastMCP tools have description attribute)
-            assert hasattr(tool, 'description')
-            assert tool.description is not None and tool.description.strip() != ""
-    
-    def test_server_capabilities(self):
-        """Test server declares proper MCP capabilities."""
-        # Test that the server supports the expected transports
-        transports = ["stdio", "http", "sse"]
-        
-        for transport in transports:
-            assert transport in TransportType.values()
-    
-    @pytest.mark.asyncio
-    async def test_error_response_format(self):
-        """Test that error responses follow MCP format."""
-        # Test with invalid configuration to trigger errors
-        original_url = config.url
-        config.url = ""
-        
-        try:
-            result = await health_check_wrapper()
-            
-            # Error responses should be structured
-            assert isinstance(result, dict)
-            assert "status" in result
-            assert result["status"] in ["unhealthy", "degraded", "error"]
-            
-        finally:
-            config.url = original_url
+            has_desc = (
+                hasattr(tool, 'description') and tool.description
+                or hasattr(tool, '__doc__') and tool.__doc__
+            )
+            assert has_desc, f"{tool.__name__} has no description or docstring"
 
 
-class TestMCPConcurrencyAndPerformance:
-    """Test MCP tools handle concurrency and perform well."""
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_concurrent_tool_execution(self, mock_request, mock_prometheus_response):
-        """Test tools can handle concurrent execution."""
-        def mock_side_effect(endpoint, params=None):
-            if endpoint == "targets":
-                return {"activeTargets": [], "droppedTargets": []}
-            elif endpoint == "label/__name__/values":
-                return ["up", "prometheus_build_info"]
-            else:
-                return mock_prometheus_response["data"]
-        
-        mock_request.side_effect = mock_side_effect
-        
-        # Create multiple concurrent tasks
-        tasks = [
-            execute_query_wrapper("up"),
-            execute_query_wrapper("prometheus_build_info"),
-            list_metrics_wrapper(),
-            get_targets_wrapper()
-        ]
-        
-        # Execute concurrently
-        results = await asyncio.gather(*tasks)
-        
-        # All should complete successfully
-        assert len(results) == 4
-        for result in results:
-            assert result is not None
-    
-    @patch('test_mcp_protocol_compliance.make_prometheus_request')
-    @pytest.mark.asyncio
-    async def test_tool_timeout_handling(self, mock_request):
-        """Test tools handle timeouts gracefully."""
-        # Simulate slow response
-        def slow_response(*args, **kwargs):
-            import time
-            time.sleep(0.1)
-            return {"resultType": "vector", "result": []}
-        
-        mock_request.side_effect = slow_response
-        
-        # This should complete (not testing actual timeout, just that it's async)
-        result = await execute_query_wrapper("up")
-        assert result is not None
+# ---------------------------------------------------------------------------
+# run_server stdio branch
+# ---------------------------------------------------------------------------
+
+class TestRunServerBranches:
+
+    @patch("monitor_mcp_server.tools.setup_environment")
+    @patch("monitor_mcp_server.tools.mcp.run")
+    @patch("monitor_mcp_server.tools.config")
+    def test_run_server_stdio(self, mock_config, mock_run, mock_setup):
+        mock_setup.return_value = True
+        mock_config.mcp_server_config = MCPServerConfig(
+            mcp_server_transport="stdio", mcp_bind_host=None, mcp_bind_port=None
+        )
+        from monitor_mcp_server.tools import run_server
+        run_server()
+        mock_run.assert_called_once_with(transport="stdio")
