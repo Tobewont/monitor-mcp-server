@@ -3,6 +3,8 @@
 import asyncio
 import atexit
 import json
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
@@ -71,13 +73,22 @@ def _sync_close_client() -> None:
 atexit.register(_sync_close_client)
 
 
-def _sanitize_url(url: str) -> str:
+def sanitize_url(url: str) -> str:
     """移除 URL 中的敏感信息，用于安全日志记录。
 
     清理范围：
     - netloc 里的 userinfo（`user:pass@host`）
     - query string 里落在 SENSITIVE_QUERY_KEYS 的键，值统一替换为 ***
+    - fragment 里的 SENSITIVE_QUERY_KEYS（部分 OAuth 隐式流程将 token 放在 fragment）
     """
+    def _mask_pairs(raw: str) -> str:
+        items = parse_qsl(raw, keep_blank_values=True)
+        sanitized = [
+            (k, "***" if k.lower() in SENSITIVE_QUERY_KEYS else v)
+            for k, v in items
+        ]
+        return urlencode(sanitized, safe="*")
+
     try:
         parsed = urlparse(url)
         netloc = parsed.netloc
@@ -87,24 +98,55 @@ def _sanitize_url(url: str) -> str:
                 host = f"{host}:{parsed.port}"
             netloc = host
 
-        query = parsed.query
-        if query:
-            items = parse_qsl(query, keep_blank_values=True)
-            sanitized_items = [
-                (k, "***" if k.lower() in SENSITIVE_QUERY_KEYS else v)
-                for k, v in items
-            ]
-            # safe="*" 让掩码值保留 `***` 原字符，便于日志可读
-            query = urlencode(sanitized_items, safe="*")
+        query = _mask_pairs(parsed.query) if parsed.query else parsed.query
+        fragment = parsed.fragment
+        if fragment and "=" in fragment:
+            fragment = _mask_pairs(fragment)
 
-        if netloc != parsed.netloc or query != parsed.query:
-            return urlunparse(parsed._replace(netloc=netloc, query=query))
+        if (netloc != parsed.netloc
+                or query != parsed.query
+                or fragment != parsed.fragment):
+            return urlunparse(parsed._replace(
+                netloc=netloc, query=query, fragment=fragment,
+            ))
     except Exception:
         pass
     return url
 
 
-def _validate_query(query: str) -> None:
+def _parse_retry_after(value: Optional[str], cap_seconds: float = 60.0) -> Optional[float]:
+    """解析 HTTP Retry-After 响应头，支持 delta-seconds 或 HTTP-date 两种格式。
+
+    返回应等待的秒数（>=0），无法解析时返回 None。封顶 ``cap_seconds`` 防止
+    上游返回过长（例如几小时）导致客户端长时间挂起。
+    """
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+        if seconds < 0:
+            return 0.0
+        return min(seconds, cap_seconds)
+    except ValueError:
+        pass
+    try:
+        target = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if target is None:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    delta = (target - datetime.now(timezone.utc)).total_seconds()
+    if delta <= 0:
+        return 0.0
+    return min(delta, cap_seconds)
+
+
+def validate_query(query: str) -> None:
     """校验 PromQL 查询的基本合法性。
 
     拦截：空字符串、超长查询、包含控制字符（NUL/换行等易造成日志注入或上游异常）。
@@ -191,7 +233,7 @@ async def make_prometheus_request(
     effective_timeout = timeout if timeout is not None else DEFAULT_REQUEST_TIMEOUT
     api_prefix = get_api_prefix(config.backend_type)
     url = f"{url_base.rstrip('/')}{api_prefix}/{endpoint}"
-    safe_url = _sanitize_url(url)
+    safe_url = sanitize_url(url)
     auth_headers, auth = get_prometheus_auth()
     headers = {**auth_headers}
     if config.org_id:
@@ -215,10 +257,15 @@ async def make_prometheus_request(
             )
 
             if response.status_code in RETRY_STATUS_CODES and attempt < RETRY_MAX_ATTEMPTS:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                backoff = RETRY_BASE_DELAY * (2 ** attempt)
+                # 优先使用上游 Retry-After（429/503 常见），与指数退避取较大值，
+                # 既尊重上游限流策略，也保留指数退避的下限保护。
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                delay = max(backoff, retry_after) if retry_after is not None else backoff
                 logger.warning("返回可重试状态码",
                                status_code=response.status_code,
                                attempt=attempt + 1, next_delay=delay,
+                               retry_after=retry_after,
                                endpoint=endpoint)
                 await asyncio.sleep(delay)
                 continue
@@ -262,12 +309,14 @@ async def make_prometheus_request(
         except httpx.HTTPStatusError as e:
             logger.error("HTTP 状态码异常",
                          endpoint=endpoint, url=safe_url,
-                         status_code=e.response.status_code, error=str(e))
+                         status_code=e.response.status_code,
+                         attempt=attempt + 1, error=str(e))
             raise
 
         except httpx.HTTPError as e:
             logger.error("HTTP 请求失败",
-                         endpoint=endpoint, url=safe_url, error=str(e))
+                         endpoint=endpoint, url=safe_url,
+                         attempt=attempt + 1, error=str(e))
             raise
 
         except ValueError:
@@ -275,7 +324,8 @@ async def make_prometheus_request(
 
         except Exception as e:
             logger.error("请求发生异常",
-                         endpoint=endpoint, url=safe_url, error=str(e))
+                         endpoint=endpoint, url=safe_url,
+                         attempt=attempt + 1, error=str(e))
             raise
 
     if last_exception:
@@ -306,7 +356,7 @@ def setup_environment() -> bool:
         logger.error(
             "URL 格式无效",
             error="PROMETHEUS_URL 必须以 http:// 或 https:// 开头",
-            current_value=_sanitize_url(config.url)
+            current_value=sanitize_url(config.url)
         )
         return False
 
@@ -314,7 +364,7 @@ def setup_environment() -> bool:
         logger.error(
             "Ruler URL 格式无效",
             error="RULER_URL 必须以 http:// 或 https:// 开头",
-            current_value=_sanitize_url(config.ruler_url)
+            current_value=sanitize_url(config.ruler_url)
         )
         return False
 
@@ -338,7 +388,7 @@ def setup_environment() -> bool:
             "Thanos 模式下检测到 RULER_URL",
             note="建议删除 RULER_URL，改由 PROMETHEUS_URL（Thanos Query）聚合所有 Ruler 副本；"
                  "若 RULER_URL 指向单个 Ruler 实例，只能看到该副本负责分片的告警",
-            ruler_url=_sanitize_url(config.ruler_url)
+            ruler_url=sanitize_url(config.ruler_url)
         )
 
     if config.token and (config.username or config.password):
@@ -376,11 +426,27 @@ def setup_environment() -> bool:
     logger.info(
         "配置校验通过",
         backend_type=config.backend_type,
-        query_url=_sanitize_url(config.url),
-        ruler_url=_sanitize_url(config.ruler_url) if config.ruler_url else "(同 query_url)",
+        query_url=sanitize_url(config.url),
+        ruler_url=sanitize_url(config.ruler_url) if config.ruler_url else "(同 query_url)",
         api_prefix=get_api_prefix(config.backend_type),
         authentication=auth_method,
         org_id=config.org_id if config.org_id else None
     )
 
     return True
+
+
+# 公开 API 列表
+__all__ = [
+    "make_prometheus_request",
+    "get_prometheus_auth",
+    "setup_environment",
+    "build_error_response",
+    "sanitize_url",
+    "validate_query",
+    "aclose_client",
+]
+
+# 向后兼容别名（旧代码可能使用下划线前缀）
+_sanitize_url = sanitize_url
+_validate_query = validate_query

@@ -18,6 +18,14 @@ Dockerfile
 **/.coverage
 **/htmlcov
 *.egg-info
+build/
+dist/
+
+# Virtualenv（本地常见开发产物，体积可能数百 MB，必须排除）
+.venv/
+venv/
+env/
+ENV/
 
 # Environment
 .env

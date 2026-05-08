@@ -9,6 +9,8 @@ description: 通过 Monitor MCP Server 智能查询 Prometheus / Thanos / Mimir 
 
 本 Skill 支持多种 MCP 调用方式，适配不同客户端环境。
 
+> **进阶参考**：消歧策略、step 选取、PromQL 模式、常见问题排查等深度内容请阅读 [`references/reference.md`](./references/reference.md)。当用户的查询涉及 cluster/namespace/pod 命名歧义、长时间范围趋势分析或非常规 PromQL 时，先查阅 reference 文档。
+
 ---
 
 ## 环境变量
@@ -249,16 +251,16 @@ avg by (namespace) (k8s:pod:memory:used:percent{cluster="vm-host-prod"})
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `health_check` | 无 | 健康检查（含 Prometheus 连通性）|
-| `list_metrics` | `page`, `page_size` | 列出指标（`page_size=0` 返回全部）|
+| `health_check` | `target?`（all/prometheus/ruler） | 健康检查（含后端连通性）|
+| `list_metrics` | `page?`, `page_size?`, `contains?`, `prefix?` | 列出指标（`page_size=0` 返回全部，支持子串/前缀过滤）|
 | `get_metric_metadata` | `metric` | 获取指标元数据（类型、描述）|
-| `get_metric_labels` | `metric` | 获取标签结构（限 1 条序列，省 Token）|
+| `get_metric_labels` | `metric`, `sample_size?` | 获取标签结构（默认采样 10 条序列合并去重，可调，最大 100）|
 | `get_label_values` | `label` | 获取标签所有值 |
 | `execute_query` | `query`, `time?`, `timeout?` | 即时查询 |
 | `execute_range_query` | `query`, `start`, `end`, `step`, `timeout?` | 范围查询 |
-| `get_alerts` | 无 | 获取告警（支持 RULER_URL）|
-| `get_rules` | 无 | 获取规则（支持 RULER_URL）|
-| `get_targets` | 无 | 获取抓取目标信息 |
+| `get_alerts` | `state?`, `severity?`, `label_filters?`, `include_annotations?`, `summary_only?`, `page?`, `page_size?` | 获取告警，支持过滤/分页/聚合摘要（自动按 `RULER_URL` 路由）|
+| `get_rules` | `type_filter?`, `group_contains?`, `file_contains?`, `rule_name_contains?`, `include_rules?`, `page?`, `page_size?` | 获取规则，支持过滤/分页/轻量模式（自动按 `RULER_URL` 路由）|
+| `get_targets` | `health?`, `job_contains?`, `include_dropped?`, `page?`, `page_size?` | 获取抓取目标，支持过滤/分页 |
 
 ---
 

@@ -16,6 +16,13 @@ spec:
         app.kubernetes.io/name: monitor-mcp-server
         app.kubernetes.io/component: mcp
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: monitor-mcp
           image: monitor-mcp-server:latest
@@ -24,14 +31,22 @@ spec:
               containerPort: 8000
               protocol: TCP
           env:
+            # 显式声明后端类型；prometheus / thanos / mimir / victoriametrics
+            - name: BACKEND_TYPE
+              value: "thanos"
             - name: PROMETHEUS_URL
               value: "http://thanos-query.monitoring:9090"
             - name: PROMETHEUS_MCP_SERVER_TRANSPORT
               value: "streamable-http"
             - name: PROMETHEUS_MCP_BIND_HOST
               value: "0.0.0.0"
-            - name: RULER_URL
-              value: "http://thanos-ruler.monitoring:9090"
+            # RULER_URL：Thanos 场景下不要设置！
+            #   * Thanos Query (v0.13+) 已聚合 /api/v1/alerts 与 /api/v1/rules，
+            #     直接走 Thanos Query 才能拿到全量；
+            #   * 指向单一 Ruler 实例只能看到该副本评估的分片数据。
+            #   仅 VictoriaMetrics 场景需要把 RULER_URL 指向 vmalert。
+            # - name: RULER_URL
+            #   value: "http://vmalert.monitoring:8880"
             - name: PROMETHEUS_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -85,6 +100,7 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 3
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 1000
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

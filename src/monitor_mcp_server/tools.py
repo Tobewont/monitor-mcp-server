@@ -6,6 +6,7 @@ from collections import Counter
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
 
+import httpx
 from fastmcp import FastMCP
 
 from monitor_mcp_server.config import (
@@ -14,7 +15,7 @@ from monitor_mcp_server.config import (
     DEFAULT_LABEL_SAMPLE_SIZE, MAX_LABEL_SAMPLE_SIZE,
 )
 from monitor_mcp_server.client import (
-    make_prometheus_request, _sanitize_url, _validate_query,
+    make_prometheus_request, sanitize_url, validate_query,
     setup_environment, build_error_response,
 )
 from monitor_mcp_server.logging_config import setup_logging, get_logger
@@ -63,11 +64,19 @@ def _paginate(items: List[Any], page: int, page_size: int) -> Dict[str, Any]:
 
 
 def _classify_exception(exc: BaseException) -> str:
-    """把常见异常归类为 error_type。"""
-    name = exc.__class__.__name__
-    if "Timeout" in name:
+    """把常见异常归类为 error_type。
+
+    优先用 isinstance 判断 httpx 的具体异常类，避免依赖类名字符串匹配
+    （子类被重命名后会静默退化为 internal）。
+    """
+    if isinstance(exc, httpx.TimeoutException):
         return "timeout"
-    if "Connection" in name or "RequestException" in name or "HTTPError" in name:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code if exc.response is not None else 0
+        if status in (401, 403):
+            return "auth"
+        return "upstream"
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, httpx.HTTPError)):
         return "network"
     if isinstance(exc, ValueError):
         # ValueError 可能来自上游 API 错误（build in client.py），也可能来自校验
@@ -75,6 +84,12 @@ def _classify_exception(exc: BaseException) -> str:
         if "API 错误" in msg or "无效的 JSON" in msg:
             return "upstream"
         return "client"
+    # 兜底：保留旧的类名匹配以兼容自定义异常
+    name = exc.__class__.__name__
+    if "Timeout" in name:
+        return "timeout"
+    if "Connection" in name or "RequestException" in name or "HTTPError" in name:
+        return "network"
     return "internal"
 
 
@@ -135,7 +150,7 @@ async def health_check(target: str = "all") -> Dict[str, Any]:
         if check_prometheus:
             if config.url:
                 prom_info: Dict[str, Any] = {
-                    "url": _sanitize_url(config.url),
+                    "url": sanitize_url(config.url),
                     "dedicated": True,
                 }
                 try:
@@ -159,7 +174,7 @@ async def health_check(target: str = "all") -> Dict[str, Any]:
             is_dedicated = bool(config.ruler_url)
             if ruler_url:
                 ruler_info: Dict[str, Any] = {
-                    "url": _sanitize_url(ruler_url),
+                    "url": sanitize_url(ruler_url),
                     "dedicated": is_dedicated,
                 }
                 try:
@@ -209,7 +224,7 @@ async def execute_query(
         包含结果类型（vector、matrix、scalar、string）和值的查询结果
     """
     try:
-        _validate_query(query)
+        validate_query(query)
         params = {"query": query}
         if time:
             params["time"] = time
@@ -258,7 +273,7 @@ async def execute_range_query(
         范围查询结果，通常为 matrix 类型
     """
     try:
-        _validate_query(query)
+        validate_query(query)
         params = {"query": query, "start": start, "end": end, "step": step}
 
         kwargs = {}
@@ -350,15 +365,16 @@ async def get_metric_metadata(metric: str) -> Dict[str, Any]:
 
     Args:
         metric: 指标名称
+
+    Returns:
+        统一结构 ``{"metric": ..., "metadata": {...}}``，错误时返回 ``status=error``。
     """
     logger.info("获取指标元数据", metric=metric)
 
     try:
         data = await make_prometheus_request("metadata", params={"metric": metric})
 
-        if isinstance(data, dict):
-            metadata = data
-        else:
+        if not isinstance(data, dict):
             logger.warning("元数据响应格式异常", data_type=type(data), metric=metric)
             return build_error_response(
                 "响应格式异常", error_type="upstream",
@@ -366,7 +382,7 @@ async def get_metric_metadata(metric: str) -> Dict[str, Any]:
             )
 
         logger.info("指标元数据获取完成", metric=metric)
-        return metadata
+        return {"metric": metric, "metadata": data}
 
     except Exception as e:
         logger.error("获取指标元数据失败", metric=metric, error=str(e))
@@ -470,6 +486,14 @@ async def get_label_values(label: str) -> Dict[str, Any]:
     try:
         data = await make_prometheus_request(f"label/{label}/values")
 
+        if not isinstance(data, list):
+            logger.warning("标签值响应格式异常", label=label, data_type=type(data).__name__)
+            return build_error_response(
+                f"label values API 期望返回列表，实际为 {type(data).__name__}",
+                error_type="upstream",
+                label=label, raw_data=data,
+            )
+
         logger.info("标签值获取完成", label=label, total_values=len(data))
         return {"label": label, "values": data, "total": len(data)}
 
@@ -550,7 +574,9 @@ async def get_alerts(
     try:
         data = await make_prometheus_request("alerts", base_url=_get_ruler_url())
 
-        raw_alerts = data.get("alerts", []) if isinstance(data, dict) else []
+        raw_alerts = data.get("alerts") if isinstance(data, dict) else None
+        if not isinstance(raw_alerts, list):
+            raw_alerts = []
         total_raw = len(raw_alerts)
 
         filtered: List[Dict[str, Any]] = []
@@ -694,7 +720,9 @@ async def get_rules(
     try:
         data = await make_prometheus_request("rules", base_url=_get_ruler_url())
 
-        raw_groups = data.get("groups", []) if isinstance(data, dict) else []
+        raw_groups = data.get("groups") if isinstance(data, dict) else None
+        if not isinstance(raw_groups, list):
+            raw_groups = []
 
         grp_needle = group_contains.lower() if group_contains else ""
         file_needle = file_contains.lower() if file_contains else ""
@@ -713,7 +741,9 @@ async def get_rules(
             if file_needle and file_needle not in str(g.get("file", "")).lower():
                 continue
 
-            rules = g.get("rules", []) or []
+            rules = g.get("rules") or []
+            if not isinstance(rules, list):
+                rules = []
             kept_rules: List[Dict[str, Any]] = []
             g_alerting = 0
             g_recording = 0
@@ -814,8 +844,12 @@ async def get_targets(
     try:
         data = await make_prometheus_request("targets")
 
-        active_raw = data.get("activeTargets", []) if isinstance(data, dict) else []
-        dropped_raw = data.get("droppedTargets", []) if isinstance(data, dict) else []
+        active_raw = data.get("activeTargets") if isinstance(data, dict) else None
+        dropped_raw = data.get("droppedTargets") if isinstance(data, dict) else None
+        if not isinstance(active_raw, list):
+            active_raw = []
+        if not isinstance(dropped_raw, list):
+            dropped_raw = []
 
         job_needle = job_contains.lower() if job_contains else ""
 
@@ -851,11 +885,13 @@ async def get_targets(
                 "include_dropped": include_dropped,
             },
         }
+        result["dropped_total"] = len(dropped_raw)
         if include_dropped:
             result["droppedTargets"] = dropped_raw
-            result["dropped_total"] = len(dropped_raw)
         else:
-            result["dropped_total"] = len(dropped_raw)
+            # 显式给出空数组并标记 omitted，避免客户端误以为字段消失
+            result["droppedTargets"] = []
+            result["dropped_omitted"] = True
 
         logger.info("抓取目标获取完成",
                     active_targets=len(active_raw),

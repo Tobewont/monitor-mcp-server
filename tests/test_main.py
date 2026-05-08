@@ -69,31 +69,33 @@ def test_setup_environment_with_custom_mcp_config_caps(mock_config):
 
     assert setup_environment() is True
 
-@patch("monitor_mcp_server.client.config")
-def test_setup_environment_with_undefined_mcp_server_transports(mock_config):
+def test_mcp_server_config_requires_transport():
+    """MCPServerConfig.__post_init__ 应拒绝缺失 transport。"""
     with pytest.raises(ValueError, match="PROMETHEUS_MCP_SERVER_TRANSPORT 为必填项"):
-        mock_config.mcp_server_config = MCPServerConfig(
+        MCPServerConfig(
             mcp_server_transport=None,
             mcp_bind_host="localhost",
-            mcp_bind_port=5000
+            mcp_bind_port=5000,
         )
 
-@patch("monitor_mcp_server.client.config")
-def test_setup_environment_with_undefined_mcp_bind_host(mock_config):
+
+def test_mcp_server_config_requires_bind_host_for_http():
+    """非 stdio 传输必须提供 bind_host。"""
     with pytest.raises(ValueError, match="PROMETHEUS_MCP_BIND_HOST 为必填项"):
-        mock_config.mcp_server_config = MCPServerConfig(
+        MCPServerConfig(
             mcp_server_transport="sse",
             mcp_bind_host=None,
-            mcp_bind_port=5000
+            mcp_bind_port=5000,
         )
 
-@patch("monitor_mcp_server.client.config")
-def test_setup_environment_with_undefined_mcp_bind_port(mock_config):
+
+def test_mcp_server_config_requires_bind_port_for_http():
+    """非 stdio 传输必须提供 bind_port。"""
     with pytest.raises(ValueError, match="PROMETHEUS_MCP_BIND_PORT 为必填项"):
-        mock_config.mcp_server_config = MCPServerConfig(
+        MCPServerConfig(
             mcp_server_transport="sse",
             mcp_bind_host="localhost",
-            mcp_bind_port=None
+            mcp_bind_port=None,
         )
 
 @patch("monitor_mcp_server.client.config")

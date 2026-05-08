@@ -2,9 +2,11 @@
 
 import os
 import time
+import socket
+import urllib.error
+import urllib.request
 import pytest
 import subprocess
-import requests
 import json
 import tempfile
 from pathlib import Path
@@ -183,16 +185,17 @@ class TestDockerContainerHTTP:
             container.reload()
             assert container.status == 'running'
             
-            # Try to connect to the HTTP port
-            # Note: This might fail if the MCP server doesn't accept HTTP requests
-            # but the port should be open
+            # 验证端口可达即可，不强求 HTTP 200（FastMCP streamable-http 的入口在 /mcp）
             try:
-                response = requests.get('http://localhost:8000', timeout=5)
-                # Any response (including error) means the port is accessible
-            except requests.exceptions.ConnectionError:
+                with socket.create_connection(("127.0.0.1", 8000), timeout=5):
+                    pass
+            except OSError:
                 pytest.fail("HTTP port not accessible")
-            except requests.exceptions.RequestException:
-                # Other request exceptions are okay - port is open but MCP protocol
+            try:
+                urllib.request.urlopen('http://localhost:8000/mcp', timeout=5)
+            except urllib.error.HTTPError:
+                pass
+            except urllib.error.URLError:
                 pass
             
         finally:
@@ -306,36 +309,40 @@ class TestDockerEnvironmentVariables:
             except:
                 pass  # Container might already be auto-removed
     
-    def test_invalid_port_fails(self, docker_client, docker_image):
-        """Test that invalid port causes container to fail."""
+    def test_invalid_port_falls_back_to_default(self, docker_client, docker_image):
+        """非法端口会被 _safe_parse_port 兜底到默认 8000，容器应正常启动。
+
+        设计选择：端口解析失败时打印警告并使用默认端口，避免因配置笔误导致
+        容器立即崩溃；如需严格失败可修改 _safe_parse_port 重新抛错。
+        """
         container = docker_client.containers.run(
             docker_image,
             environment={
                 'PROMETHEUS_URL': 'http://test-prometheus:9090',
                 'PROMETHEUS_MCP_SERVER_TRANSPORT': 'streamable-http',
-                'PROMETHEUS_MCP_BIND_PORT': 'invalid-port'
+                'PROMETHEUS_MCP_BIND_HOST': '0.0.0.0',
+                'PROMETHEUS_MCP_BIND_PORT': 'invalid-port',
             },
             detach=True,
-            remove=True
+            remove=True,
         )
-        
+
         try:
-            # Wait for container to exit with timeout
-            # Container with invalid port should exit quickly with error
-            result = container.wait(timeout=10)
-            
-            # Check that it exited with non-zero status (indicating configuration error)
-            assert result['StatusCode'] != 0
-            
-            # The fact that it exited quickly with non-zero status indicates
-            # the invalid port was detected properly
-            
+            time.sleep(3)
+            container.reload()
+            assert container.status == 'running', (
+                f"非法端口应回退到默认 8000 后容器仍在运行，实际状态: {container.status}"
+            )
+            logs = container.logs().decode('utf-8', errors='ignore')
+            assert 'invalid-port' in logs or '默认端口' in logs or 'default' in logs.lower(), (
+                "应在日志中输出关于非法端口的告警"
+            )
         finally:
             try:
                 container.stop()
                 container.remove()
-            except:
-                pass  # Container might already be auto-removed
+            except Exception:
+                pass
 
 
 class TestDockerSecurity:

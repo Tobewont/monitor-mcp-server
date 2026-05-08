@@ -1,8 +1,10 @@
 # Monitor MCP Server
 
-[English](README_EN.md)
+![python](https://img.shields.io/badge/python-3.12%2B-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
-基于 [MCP（Model Context Protocol）](https://modelcontextprotocol.io) 协议的监控查询服务器，为 AI 助手提供 **Prometheus**、**Thanos**、**Mimir**、**VictoriaMetrics** 的指标查询与分析能力。
+**[English](README_EN.md)** | 中文
+
+基于 [MCP（Model Context Protocol）](https://modelcontextprotocol.io) 协议的 Monitor MCP Server，提供 **Prometheus**、**Thanos**、**Mimir**、**VictoriaMetrics** 的指标查询与分析能力。
 
 > 通过 `BACKEND_TYPE` 声明后端类型，服务器会自动选择合适的 API 路径前缀（Mimir 使用 `/prometheus/api/v1`）。绝大多数部署下只需要配 `PROMETHEUS_URL` 一个地址；只有 VictoriaMetrics 需要额外配置 `RULER_URL` 指向 vmalert。
 
@@ -16,7 +18,7 @@
 | `execute_range_query` | 执行带时间范围和步长的 PromQL 范围查询（支持自定义超时） |
 | `list_metrics` | 列出可用指标名称（支持分页，默认每页 50 条） |
 | `get_metric_metadata` | 获取指定指标的类型、说明等元数据 |
-| `get_metric_labels` | 获取指定指标的标签结构（限制 1 条序列，最小化传输） |
+| `get_metric_labels` | 获取指定指标的标签结构（默认采样 10 条序列合并去重，可调，最大 100） |
 | `get_label_values` | 获取指定标签的所有值 |
 | `get_alerts` | 获取当前触发的告警列表（支持 RULER_URL 路由） |
 | `get_rules` | 获取所有告警规则和记录规则（支持 RULER_URL 路由） |
@@ -158,7 +160,7 @@ services:
       - PROMETHEUS_MCP_BIND_HOST=0.0.0.0
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/mcp')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -238,8 +240,9 @@ kubectl get pods -l app.kubernetes.io/name=monitor-mcp-server
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
 | `metric` | string | ✅ | 指标名称 |
+| `sample_size` | int | | 采样的时间序列条数（默认 10，上限 100，最小 1）|
 
-返回该指标的标签键及一个示例值（通过 `limit=1` 优化性能）。
+通过 series API 取前 N 条时间序列并对每个标签合并去重出示例值列表，既能呈现枚举型标签的多个取值，又能控制 Token 消耗。注意：`limit` 参数需要 Prometheus 2.33+，旧版本会忽略。
 
 ### `get_label_values`
 
@@ -253,27 +256,79 @@ kubectl get pods -l app.kubernetes.io/name=monitor-mcp-server
 
 ### `get_alerts`
 
-无参数。返回当前触发的告警列表。若配置了 `RULER_URL`，请求自动路由到 Ruler 组件。
+返回当前触发的告警列表，支持过滤、分页、按 alertname 聚合摘要。底层路由：若配置了 `RULER_URL` 则走 Ruler，否则走 `PROMETHEUS_URL`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `state` | string | | 状态过滤：`all`（默认）/ `firing` / `pending` |
+| `severity` | string | | 仅保留匹配该 severity 标签的条目（空字符串不过滤）|
+| `label_filters` | string(JSON) | | 按标签等值过滤，例如 `'{"job":"node-agent","namespace":"prod"}'` |
+| `include_annotations` | bool | | 是否在明细里保留 annotations 字段（默认 true，关闭可减少 Token）|
+| `summary_only` | bool | | true 时按 alertname 聚合，返回每条规则的 state/severity 分布 |
+| `page` | int | | 页码（仅在 `summary_only=false` 且 `page_size>0` 时生效）|
+| `page_size` | int | | 每页条数（默认 0 = 返回全部；上限 500）|
 
 ```json
-{ "alerts": [...], "total": 5, "firing": 3, "pending": 2 }
+{ "alerts": [...], "total": 5, "source_total": 5, "firing": 3, "pending": 2,
+  "page": 1, "page_size": 0, "total_pages": 1, "filters": {...} }
 ```
 
 ### `get_rules`
 
-无参数。返回所有规则组（含告警规则和记录规则）。若配置了 `RULER_URL`，请求自动路由到 Ruler 组件。
+返回所有告警规则和记录规则，支持类型/名称过滤、分页、轻量模式。底层路由同 `get_alerts`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `type_filter` | string | | 规则类型：`all`（默认）/ `alerting` / `recording` |
+| `group_contains` | string | | 仅保留 `group.name` 包含该子串的组（不区分大小写）|
+| `file_contains` | string | | 仅保留 `group.file` 包含该子串的组 |
+| `rule_name_contains` | string | | 仅保留组内 `rule.name` 包含该子串的规则 |
+| `include_rules` | bool | | false 时返回组级汇总（不含 rules 数组），适合大体量预览 |
+| `page` | int | | 页码（作用在组级）|
+| `page_size` | int | | 每页组数（默认 0 = 全部；上限 500）|
 
 ```json
-{ "groups": [...], "total_groups": 3, "total_rules": 12 }
+{ "groups": [...], "total_groups": 3, "total_rules": 12,
+  "total_alerting": 8, "total_recording": 4, "page": 1, "page_size": 0,
+  "total_pages": 1, "filters": {...} }
 ```
 
 ### `get_targets`
 
-无参数。返回 `activeTargets` 和 `droppedTargets` 数组。
+返回所有抓取目标的健康状态，支持过滤和分页。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `health` | string | | 健康状态：`all`（默认）/ `up` / `down` / `unknown` |
+| `job_contains` | string | | 仅保留 `labels.job` 包含该子串的目标（不区分大小写）|
+| `include_dropped` | bool | | 是否返回 `droppedTargets` 数组（默认 true，关闭可减小响应体积）|
+| `page` | int | | 页码（作用在 `activeTargets`）|
+| `page_size` | int | | 每页条数（默认 0 = 全部；上限 500）|
+
+返回包含 `activeTargets`、`droppedTargets`（可被 `include_dropped=false` 关闭）、`health_counts`（健康度分布）等字段。
 
 ### `health_check`
 
-无参数。返回服务状态、版本、Prometheus 连通性等信息。
+服务自身健康检查，附带后端连通性探测。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `target` | string | | 检查目标：`all`（默认，同时检查 Prometheus 与 Ruler）/ `prometheus` / `ruler` |
+
+返回字段：
+
+- `status`：`healthy` / `degraded` / `unhealthy`
+- `timestamp`：UTC ISO8601 时间戳
+- `prometheus`：`{ url, dedicated, connectivity, error? }`（仅 `target` 包含 prometheus 时返回）
+- `ruler`：`{ url, dedicated, connectivity, error? }`（仅 `target` 包含 ruler 且地址可解析时返回）
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-05-08T01:23:45+00:00",
+  "prometheus": { "url": "http://prometheus:9090", "dedicated": true, "connectivity": "healthy" }
+}
+```
 
 ---
 
@@ -288,6 +343,30 @@ kubectl get pods -l app.kubernetes.io/name=monitor-mcp-server
 多租户场景下设置 `ORG_ID`，请求头会自动携带 `X-Scope-OrgID`。
 
 > **安全警告**：在 SSE 或 streamable-http 模式下，MCP Server 会监听 HTTP 端口。请勿将该端口直接暴露到公网，建议通过反向代理（如 Nginx）、mTLS、或 Kubernetes NetworkPolicy 限制访问。
+
+#### Kubernetes NetworkPolicy 最小化模板
+
+仅允许指定 namespace（这里用 `mcp-clients` 标签举例）访问 MCP Server，所有其他入站流量被拒绝：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monitor-mcp-server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: monitor-mcp-server
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              role: mcp-clients
+      ports:
+        - protocol: TCP
+          port: 8000
+```
 
 ---
 
@@ -379,4 +458,4 @@ kube_pod_container_status_restarts_total
 
 ## 许可证
 
-MIT
+MIT License - 详见 [LICENSE](./LICENSE) 文件

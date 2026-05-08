@@ -1,10 +1,12 @@
 # Monitor MCP Server
 
-[中文文档](README.md)
+![python](https://img.shields.io/badge/python-3.12%2B-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that gives AI assistants the ability to query and analyze metrics from **Prometheus**, **Thanos**, **Mimir**, and **VictoriaMetrics**.
+English | **[中文](README.md)**
 
-> These systems share a compatible HTTP Query API (`/api/v1/*`), so a single server covers them all. Point `PROMETHEUS_URL` at the query endpoint and optionally set `RULER_URL` for alerts/rules.
+A Monitor MCP Server based on the [MCP (Model Context Protocol)](https://modelcontextprotocol.io), providing query and analysis capabilities for **Prometheus**, **Thanos**, **Mimir**, and **VictoriaMetrics** metrics.
+
+> Declare the backend with `BACKEND_TYPE` and the server picks the right API path prefix automatically (Mimir uses `/prometheus/api/v1`). For most deployments only `PROMETHEUS_URL` is required; only VictoriaMetrics needs an additional `RULER_URL` pointing at vmalert.
 
 ---
 
@@ -12,14 +14,14 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 
 | Tool | Description |
 |------|-------------|
-| `execute_query` | Run a PromQL instant query (custom timeout supported) |
-| `execute_range_query` | Run a PromQL range query with start/end/step (custom timeout supported) |
+| `execute_query` | Execute a PromQL instant query (custom timeout supported) |
+| `execute_range_query` | Execute a PromQL range query with start/end/step (custom timeout supported) |
 | `list_metrics` | List available metric names (paginated, default 50 per page) |
 | `get_metric_metadata` | Get type, help text, and other metadata for a metric |
-| `get_metric_labels` | Get label structure for a metric (limited to 1 series to save tokens) |
+| `get_metric_labels` | Get label structure for a metric (samples 10 series by default, max 100) |
 | `get_label_values` | Get all values for a given label name |
-| `get_alerts` | Get currently firing alerts (routes to `RULER_URL` if configured) |
-| `get_rules` | Get all alerting & recording rules (routes to `RULER_URL` if configured) |
+| `get_alerts` | Get currently firing alerts (routes via `RULER_URL` if configured) |
+| `get_rules` | Get all alerting & recording rules (routes via `RULER_URL` if configured) |
 | `get_targets` | Get scrape target health status |
 | `health_check` | Server health check including backend connectivity |
 
@@ -31,16 +33,30 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 
 | Variable | Description | Required | Default |
 |----------|-------------|:--------:|---------|
-| `PROMETHEUS_URL` | Query endpoint (Prometheus / Thanos Query / Mimir / VM) | Yes | — |
-| `RULER_URL` | Alert/rule endpoint (Thanos Ruler / Mimir Ruler / vmalert); falls back to `PROMETHEUS_URL` | | — |
+| `PROMETHEUS_URL` | Query endpoint (Prometheus / Thanos Query / Mimir Gateway / VM vmselect) | ✅ | — |
+| `BACKEND_TYPE` | Backend type: `prometheus` / `thanos` / `mimir` / `victoriametrics` | | `prometheus` |
+| `RULER_URL` | Standalone alert/rule endpoint; required only for VictoriaMetrics (point at vmalert), leave empty for other backends | | — |
 | `PROMETHEUS_USERNAME` | Basic Auth username | | — |
 | `PROMETHEUS_PASSWORD` | Basic Auth password | | — |
 | `PROMETHEUS_TOKEN` | Bearer token (takes precedence over Basic Auth) | | — |
-| `ORG_ID` | Multi-tenant Org ID (Thanos / Mimir) | | — |
+| `ORG_ID` | Multi-tenant Org ID (Thanos / Mimir, etc.) | | — |
 | `PROMETHEUS_MCP_SERVER_TRANSPORT` | Transport: `stdio` / `sse` / `streamable-http` | | `stdio` |
 | `PROMETHEUS_MCP_BIND_HOST` | Bind address for SSE / streamable-http | | `127.0.0.1` |
 | `PROMETHEUS_MCP_BIND_PORT` | Bind port for SSE / streamable-http | | `8000` |
 | `LOG_LEVEL` | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` | | `INFO` |
+
+### Backend Adaptation Cheat Sheet
+
+| Backend | `BACKEND_TYPE` | `PROMETHEUS_URL` | `RULER_URL` | Notes |
+|---|---|---|---|---|
+| Prometheus (native) | `prometheus` (default) | Prometheus address | **leave empty** | Single binary, all APIs on one URL |
+| Thanos | `thanos` | **Thanos Query** address | **leave empty** | Thanos Query (v0.13+) aggregates alerts/rules from all Ruler replicas |
+| Grafana Mimir | `mimir` | Mimir Gateway address | **leave empty** | Gateway routes paths; `/prometheus/api/v1` prefix is added automatically; setting `ORG_ID` is recommended |
+| VictoriaMetrics | `victoriametrics` | vmselect address | **point at vmalert** | vmselect does not expose alerts/rules; vmalert must be queried separately |
+
+> **Common pitfall**: in a multi-replica Thanos Ruler setup, pointing `RULER_URL` at a single Ruler instance means `get_alerts` / `get_rules` only see the shard evaluated by that replica. **The correct approach is to leave `RULER_URL` empty** so requests go through Thanos Query and return the aggregated full picture.
+
+> **Mimir microservices mode**: if your deployment bypasses the Gateway and talks to query-frontend directly, query-frontend will not forward alerts/rules to the Ruler. In that case point `RULER_URL` at the Mimir Ruler. The recommended approach is still to expose a unified entry through the Gateway.
 
 ### Run Locally
 
@@ -58,6 +74,8 @@ cp env.example .env
 # Start
 python main.py
 ```
+
+All configuration is provided via the `.env` file or environment variables; see the table above.
 
 ### Docker
 
@@ -80,8 +98,9 @@ docker run -i --rm \
   monitor-mcp-server
 ```
 
+### Build the Docker image
+
 ```bash
-# Build
 docker build -t monitor-mcp-server .
 ```
 
@@ -140,7 +159,8 @@ services:
       - PROMETHEUS_MCP_BIND_HOST=0.0.0.0
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      # TCP-only check; the streamable-http endpoint lives at /mcp, the root path may not respond
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -150,17 +170,20 @@ services:
 <details>
 <summary><b>Kubernetes</b></summary>
 
-Basic K8s manifests (Deployment, Service, Secret) are provided in the `k8s/` directory. Additional resources (Namespace, ConfigMap, Ingress, HPA) are available as inline examples in `k8s/README.md`.
+The project ships with a basic K8s deployment (Deployment, Service, Secret); other resources (Namespace, ConfigMap, Ingress, HPA) are provided as inline examples in `k8s/README.md`.
 
-See **[k8s/README.md](k8s/README.md)** for details.
+See **[k8s/README.md](k8s/README.md)** for full details.
+
+Quick preview:
 
 ```bash
-# Deploy (edit k8s/ configs first)
+# Deploy (edit configs under k8s/ first)
 kubectl apply -f k8s/
 
 # Verify
 kubectl get pods -l app.kubernetes.io/name=monitor-mcp-server
 ```
+
 </details>
 
 ---
@@ -173,7 +196,7 @@ Execute a PromQL instant query.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | Yes | PromQL expression |
+| `query` | string | ✅ | PromQL expression |
 | `time` | string | | Evaluation timestamp (RFC3339 or Unix) |
 | `timeout` | int | | Request timeout in seconds (default 30) |
 
@@ -187,10 +210,10 @@ Execute a PromQL range query.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | Yes | PromQL expression |
-| `start` | string | Yes | Start time |
-| `end` | string | Yes | End time |
-| `step` | string | Yes | Step (e.g. `15s`, `1m`, `1h`) |
+| `query` | string | ✅ | PromQL expression |
+| `start` | string | ✅ | Start time |
+| `end` | string | ✅ | End time |
+| `step` | string | ✅ | Step (e.g. `15s`, `1m`, `1h`) |
 | `timeout` | int | | Request timeout in seconds (default 30) |
 
 ### `list_metrics`
@@ -201,6 +224,8 @@ List available metric names with pagination.
 |-----------|------|:--------:|-------------|
 | `page` | int | | Page number, starting from 1 (default 1) |
 | `page_size` | int | | Items per page (default 50, max 500; set to 0 for all) |
+| `contains` | string | | Keep only metric names containing the substring (case-insensitive) |
+| `prefix` | string | | Keep only metric names starting with the prefix (case-insensitive) |
 
 ```json
 { "metrics": ["up", "go_goroutines", "..."], "total": 1500, "page": 1, "page_size": 50, "total_pages": 30 }
@@ -210,21 +235,24 @@ List available metric names with pagination.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `metric` | string | Yes | Metric name |
+| `metric` | string | ✅ | Metric name |
+
+Returns `{ "metric": ..., "metadata": {...} }`. On failure returns a structured error object with `status=error`.
 
 ### `get_metric_labels`
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `metric` | string | Yes | Metric name |
+| `metric` | string | ✅ | Metric name |
+| `sample_size` | int | | Number of time series to sample (default 10, max 100, min 1) |
 
-Returns label keys with one sample value per label (via `limit=1` for minimal payload).
+Fetches the first N series via the series API and merges/de-duplicates label values across them. This shows multiple values for enumerated labels while keeping payload size under control. Note: the `limit` parameter requires Prometheus 2.33+; older versions ignore it.
 
 ### `get_label_values`
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `label` | string | Yes | Label name (e.g. `job`, `instance`, `namespace`) |
+| `label` | string | ✅ | Label name (e.g. `job`, `instance`, `namespace`) |
 
 ```json
 { "label": "job", "values": ["prometheus", "node-exporter", "grafana"], "total": 3 }
@@ -232,27 +260,79 @@ Returns label keys with one sample value per label (via `limit=1` for minimal pa
 
 ### `get_alerts`
 
-No parameters. Returns currently firing alerts. Routed to Ruler if `RULER_URL` is set.
+Returns currently active alerts with filtering, pagination, and per-alertname summaries. Routing: uses `RULER_URL` if set, otherwise falls back to `PROMETHEUS_URL`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `state` | string | | State filter: `all` (default) / `firing` / `pending` |
+| `severity` | string | | Keep only entries matching this severity label (empty = no filter) |
+| `label_filters` | string(JSON) | | Equality filter on labels, e.g. `'{"job":"node-agent","namespace":"prod"}'` |
+| `include_annotations` | bool | | Whether to keep the `annotations` field in detail output (default true; turning off saves tokens) |
+| `summary_only` | bool | | When true, group by `alertname` and return per-rule state/severity distribution |
+| `page` | int | | Page number (only effective when `summary_only=false` and `page_size>0`) |
+| `page_size` | int | | Items per page (default 0 = return all; max 500) |
 
 ```json
-{ "alerts": [...], "total": 5, "firing": 3, "pending": 2 }
+{ "alerts": [...], "total": 5, "source_total": 5, "firing": 3, "pending": 2,
+  "page": 1, "page_size": 0, "total_pages": 1, "filters": {...} }
 ```
 
 ### `get_rules`
 
-No parameters. Returns all rule groups (alerting + recording). Routed to Ruler if `RULER_URL` is set.
+Returns all alerting and recording rules with type/name filtering, pagination, and a lightweight mode. Routing same as `get_alerts`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `type_filter` | string | | Rule type: `all` (default) / `alerting` / `recording` |
+| `group_contains` | string | | Keep only groups whose `name` contains the substring (case-insensitive) |
+| `file_contains` | string | | Keep only groups whose `file` contains the substring |
+| `rule_name_contains` | string | | Keep only rules whose `name` contains the substring |
+| `include_rules` | bool | | When false, return group-level summary only (no `rules` array); ideal for large catalogs |
+| `page` | int | | Page number (applied at group level) |
+| `page_size` | int | | Groups per page (default 0 = all; max 500) |
 
 ```json
-{ "groups": [...], "total_groups": 3, "total_rules": 12 }
+{ "groups": [...], "total_groups": 3, "total_rules": 12,
+  "total_alerting": 8, "total_recording": 4, "page": 1, "page_size": 0,
+  "total_pages": 1, "filters": {...} }
 ```
 
 ### `get_targets`
 
-No parameters. Returns `activeTargets` and `droppedTargets`.
+Returns scrape targets with filtering and pagination.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `health` | string | | Health filter: `all` (default) / `up` / `down` / `unknown` |
+| `job_contains` | string | | Keep only targets whose `labels.job` contains the substring (case-insensitive) |
+| `include_dropped` | bool | | Whether to return the `droppedTargets` array (default true; turn off to reduce payload) |
+| `page` | int | | Page number (applied to `activeTargets`) |
+| `page_size` | int | | Items per page (default 0 = all; max 500) |
+
+Response includes `activeTargets`, `droppedTargets` (empty + `dropped_omitted: true` when `include_dropped=false`), `health_counts` (distribution by health), and other fields.
 
 ### `health_check`
 
-No parameters. Returns service status, version, and Prometheus connectivity info.
+Server self-health check including backend connectivity probing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `target` | string | | Probe target: `all` (default; checks both Prometheus and Ruler) / `prometheus` / `ruler` |
+
+Response fields:
+
+- `status`: `healthy` / `degraded` / `unhealthy`
+- `timestamp`: UTC ISO8601 timestamp
+- `prometheus`: `{ url, dedicated, connectivity, error? }` (returned when `target` includes prometheus)
+- `ruler`: `{ url, dedicated, connectivity, error? }` (returned when `target` includes ruler and the URL resolves)
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-05-08T01:23:45+00:00",
+  "prometheus": { "url": "http://prometheus:9090", "dedicated": true, "connectivity": "healthy" }
+}
+```
 
 ---
 
@@ -266,7 +346,31 @@ Three authentication methods, in order of precedence:
 
 For multi-tenant setups, set `ORG_ID` to include `X-Scope-OrgID` in requests.
 
-> **Security Warning**: In SSE or streamable-http mode, the MCP Server listens on an HTTP port. Do not expose this port directly to the public internet. Use a reverse proxy (e.g. Nginx), mTLS, or Kubernetes NetworkPolicy to restrict access.
+> **Security warning**: in SSE or streamable-http mode the MCP Server listens on an HTTP port. Do not expose this port directly to the public internet. Use a reverse proxy (e.g. Nginx), mTLS, or a Kubernetes NetworkPolicy to restrict access.
+
+#### Minimal Kubernetes NetworkPolicy template
+
+Allow only namespaces labelled `role: mcp-clients` to reach the MCP Server; everything else is denied:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monitor-mcp-server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: monitor-mcp-server
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              role: mcp-clients
+      ports:
+        - protocol: TCP
+          port: 8000
+```
 
 ---
 
@@ -293,7 +397,7 @@ src/monitor_mcp_server/
   tools.py                           # MCP tool definitions & server startup
   logging_config.py                  # Structured logging
 tests/                               # Test suite
-skills/                              # Cursor Agent Skills
+skills/                              # AI assistant query skills
 ```
 
 ### Adding a New Tool
@@ -312,9 +416,9 @@ Add corresponding tests in `tests/test_tools.py`.
 
 ---
 
-## Agent Skill (Cursor AI Query Skill)
+## Agent Skill (AI Assistant Query Skill)
 
-This project ships with a **Cursor Agent Skill** (`skills/monitor-query/SKILL.md`) that enables AI assistants to query metrics intelligently.
+This project ships with an **Agent Skill** (`skills/monitor-query/SKILL.md`) that lets AI assistants query metrics intelligently.
 
 ### Capabilities
 
@@ -326,8 +430,8 @@ This project ships with a **Cursor Agent Skill** (`skills/monitor-query/SKILL.md
 
 ### Usage
 
-1. Add the `skills/monitor-query/` directory to your Cursor Agent Skill configuration
-2. Make sure the Monitor MCP Server service is running (registered as your configured MCP server name)
+1. Add the `skills/monitor-query/` directory to your AI assistant's Skill configuration (e.g. Cursor Agent Skill)
+2. Make sure the Monitor MCP Server is running
 3. Ask your AI assistant questions like:
    - "Query CPU usage for drama pods in the vm-host-prod cluster"
    - "Show memory usage for node 192.168.167.60"
@@ -358,4 +462,4 @@ kube_pod_container_status_restarts_total
 
 ## License
 
-MIT
+MIT License - see the [LICENSE](./LICENSE) file for details

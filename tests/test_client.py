@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from monitor_mcp_server.client import (
     make_prometheus_request,
     get_prometheus_auth,
-    _sanitize_url,
+    sanitize_url,
 )
 from monitor_mcp_server.config import config
 
@@ -289,14 +289,14 @@ async def test_prometheus_backend_uses_default_prefix(mock_client):
 
 @pytest.mark.asyncio(loop_scope=None)
 async def test_sanitize_url_removes_credentials():
-    assert _sanitize_url("http://user:pass@host:9090/path") == "http://host:9090/path"
-    assert _sanitize_url("http://host:9090/path") == "http://host:9090/path"
-    assert _sanitize_url("http://user@host/path") == "http://host/path"
+    assert sanitize_url("http://user:pass@host:9090/path") == "http://host:9090/path"
+    assert sanitize_url("http://host:9090/path") == "http://host:9090/path"
+    assert sanitize_url("http://user@host/path") == "http://host/path"
 
 
 async def test_sanitize_url_masks_sensitive_query_params():
     url = "https://h/x?token=abc&foo=1&Api_Key=xxx&Password=yyy"
-    sanitized = _sanitize_url(url)
+    sanitized = sanitize_url(url)
     assert "abc" not in sanitized
     assert "xxx" not in sanitized
     assert "yyy" not in sanitized
@@ -307,7 +307,7 @@ async def test_sanitize_url_masks_sensitive_query_params():
 
 
 async def test_sanitize_url_keeps_non_sensitive_query():
-    assert _sanitize_url("https://h/x?start=0&end=1") == "https://h/x?start=0&end=1"
+    assert sanitize_url("https://h/x?start=0&end=1") == "https://h/x?start=0&end=1"
 
 
 async def test_get_prometheus_auth_token_wins_over_basic():

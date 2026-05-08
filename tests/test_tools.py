@@ -156,8 +156,9 @@ async def test_get_metric_metadata(mock_make_request):
 
         mock_make_request.assert_called_once_with("metadata", params={"metric": "up"})
         assert isinstance(json_data, dict)
-        assert "up" in json_data
-        assert json_data["up"][0]["type"] == "gauge"
+        assert json_data["metric"] == "up"
+        assert "up" in json_data["metadata"]
+        assert json_data["metadata"]["up"][0]["type"] == "gauge"
 
 @pytest.mark.asyncio
 async def test_get_metric_labels(mock_make_request):
@@ -602,7 +603,8 @@ async def test_get_targets_health_and_job_filter(mock_make_request):
     assert data["total"] == 1
     assert data["activeTargets"][0]["labels"]["job"] == "node-agent"
     assert data["health_counts"] == {"up": 1, "down": 2}
-    assert "droppedTargets" not in data
+    assert data["droppedTargets"] == []
+    assert data.get("dropped_omitted") is True
     assert data["dropped_total"] == 1
 
 

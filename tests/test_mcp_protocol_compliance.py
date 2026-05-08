@@ -126,7 +126,8 @@ class TestMCPToolCompliance:
             result = await client.call_tool("get_metric_metadata", {"metric": "up"})
         data = json.loads(result.content[0].text)
         assert isinstance(data, dict)
-        assert "up" in data
+        assert data["metric"] == "up"
+        assert "up" in data["metadata"]
 
     @pytest.mark.asyncio
     async def test_get_label_values_returns_correct_structure(self, mock_make_request):

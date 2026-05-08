@@ -10,6 +10,12 @@ from monitor_mcp_server import __version__
 
 SERVICE_NAME = "monitor-mcp-server"
 
+# 第三方库即使在本服务 LOG_LEVEL=DEBUG 时也保持安静的 logger 列表。
+# 这些库 DEBUG 日志噪音极大（HTTP 报文体、连接复用细节、协议帧），
+# 会淹没业务日志且容易泄漏敏感请求内容。
+_NOISY_LIBS = ("httpx", "httpcore", "h11", "h2", "hpack",
+               "asyncio", "urllib3", "fastmcp", "mcp")
+
 
 def _inject_service_context(logger, method_name, event_dict):
     """structlog processor：为每条日志自动绑定 service / version 常量字段。"""
@@ -50,6 +56,11 @@ def setup_logging() -> structlog.BoundLogger:
         stream=sys.stderr,
         level=log_level,
     )
+
+    # 把吵闹的第三方库提到 max(WARNING, 当前级别)，避免 DEBUG 时被淹没。
+    quiet_level = max(log_level, logging.WARNING)
+    for name in _NOISY_LIBS:
+        logging.getLogger(name).setLevel(quiet_level)
 
     logger = structlog.get_logger(SERVICE_NAME)
     return logger
