@@ -12,7 +12,7 @@ import dotenv
 import httpx
 
 from monitor_mcp_server.config import (
-    config, TransportType, BackendType, get_api_prefix,
+    config, PrometheusConfig, TransportType, BackendType, get_api_prefix,
     DEFAULT_REQUEST_TIMEOUT, MAX_QUERY_LENGTH,
     RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY, RETRY_STATUS_CODES,
     SENSITIVE_QUERY_KEYS,
@@ -332,18 +332,20 @@ async def make_prometheus_request(
         raise last_exception
 
 
-def setup_environment() -> bool:
+def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
     """校验环境配置。
 
     Returns:
         配置有效返回 True，否则返回 False
     """
+    cfg = active_config or config
+
     if dotenv.find_dotenv():
         logger.info("环境配置已加载", source=".env 文件")
     else:
         logger.info("环境配置已加载", source="环境变量", note="未找到 .env 文件")
 
-    if not config.url:
+    if not cfg.url:
         logger.error(
             "缺少必要配置",
             error="PROMETHEUS_URL 环境变量未设置",
@@ -352,52 +354,52 @@ def setup_environment() -> bool:
         )
         return False
 
-    if not config.url.startswith(("http://", "https://")):
+    if not cfg.url.startswith(("http://", "https://")):
         logger.error(
             "URL 格式无效",
             error="PROMETHEUS_URL 必须以 http:// 或 https:// 开头",
-            current_value=sanitize_url(config.url)
+            current_value=sanitize_url(cfg.url)
         )
         return False
 
-    if config.ruler_url and not config.ruler_url.startswith(("http://", "https://")):
+    if cfg.ruler_url and not cfg.ruler_url.startswith(("http://", "https://")):
         logger.error(
             "Ruler URL 格式无效",
             error="RULER_URL 必须以 http:// 或 https:// 开头",
-            current_value=sanitize_url(config.ruler_url)
+            current_value=sanitize_url(cfg.ruler_url)
         )
         return False
 
-    if config.backend_type not in BackendType.values():
+    if cfg.backend_type not in BackendType.values():
         logger.error(
             "BACKEND_TYPE 无效",
-            error=f"不支持的后端类型: {config.backend_type}",
+            error=f"不支持的后端类型: {cfg.backend_type}",
             valid_values=BackendType.values(),
             example="prometheus"
         )
         return False
 
-    if config.backend_type == BackendType.MIMIR.value and not config.org_id:
+    if cfg.backend_type == BackendType.MIMIR.value and not cfg.org_id:
         logger.warning(
             "Mimir 后端强烈建议配置 ORG_ID",
             note="多租户场景下缺少 X-Scope-OrgID 可能导致 401/403"
         )
 
-    if config.backend_type == BackendType.THANOS.value and config.ruler_url:
+    if cfg.backend_type == BackendType.THANOS.value and cfg.ruler_url:
         logger.warning(
             "Thanos 模式下检测到 RULER_URL",
             note="建议删除 RULER_URL，改由 PROMETHEUS_URL（Thanos Query）聚合所有 Ruler 副本；"
                  "若 RULER_URL 指向单个 Ruler 实例，只能看到该副本负责分片的告警",
-            ruler_url=sanitize_url(config.ruler_url)
+            ruler_url=sanitize_url(cfg.ruler_url)
         )
 
-    if config.token and (config.username or config.password):
+    if cfg.token and (cfg.username or cfg.password):
         logger.warning(
             "同时配置了 Bearer Token 与 Basic Auth",
             note="将优先使用 Bearer Token，Basic Auth (username/password) 会被忽略",
         )
 
-    mcp_config = config.mcp_server_config
+    mcp_config = cfg.mcp_server_config
     if mcp_config:
         if str(mcp_config.mcp_server_transport).lower() not in TransportType.values():
             logger.error(
@@ -417,20 +419,59 @@ def setup_environment() -> bool:
             )
             return False
 
+    monitor_agent = getattr(cfg, "monitor_agent", None)
+    monitor_agent_enabled = getattr(monitor_agent, "enabled", False) is True
+    if monitor_agent_enabled:
+        required_fields = {
+            "MONITOR_AGENT_S3_ENDPOINT_URL": monitor_agent.s3_endpoint_url,
+            "MONITOR_AGENT_S3_BUCKET": monitor_agent.s3_bucket,
+            "MONITOR_AGENT_S3_ACCESS_KEY_ID": monitor_agent.s3_access_key_id,
+            "MONITOR_AGENT_S3_SECRET_ACCESS_KEY": monitor_agent.s3_secret_access_key,
+        }
+        missing = [name for name, value in required_fields.items() if not value]
+        if missing:
+            logger.error(
+                "monitor-agent 配置管理缺少必要配置",
+                missing=missing,
+            )
+            return False
+        if "{ip}" not in monitor_agent.asset_query_template:
+            logger.error(
+                "MONITOR_AGENT_ASSET_QUERY_TEMPLATE 无效",
+                error="模板必须包含 {ip} 占位符",
+            )
+            return False
+        if "{ip}" not in monitor_agent.reload_url_template:
+            logger.error(
+                "MONITOR_AGENT_RELOAD_URL_TEMPLATE 无效",
+                error="模板必须包含 {ip} 占位符",
+            )
+            return False
+        if monitor_agent.s3_addressing_style not in ("path", "virtual"):
+            logger.error(
+                "MONITOR_AGENT_S3_ADDRESSING_STYLE 无效",
+                valid_values=["path", "virtual"],
+            )
+            return False
+        if monitor_agent.reload_timeout <= 0:
+            logger.error("MONITOR_AGENT_RELOAD_TIMEOUT 必须大于 0")
+            return False
+
     auth_method = "none"
-    if config.token:
+    if cfg.token:
         auth_method = "bearer_token"
-    elif config.username and config.password:
+    elif cfg.username and cfg.password:
         auth_method = "basic_auth"
 
     logger.info(
         "配置校验通过",
-        backend_type=config.backend_type,
-        query_url=sanitize_url(config.url),
-        ruler_url=sanitize_url(config.ruler_url) if config.ruler_url else "(同 query_url)",
-        api_prefix=get_api_prefix(config.backend_type),
+        backend_type=cfg.backend_type,
+        query_url=sanitize_url(cfg.url),
+        ruler_url=sanitize_url(cfg.ruler_url) if cfg.ruler_url else "(同 query_url)",
+        api_prefix=get_api_prefix(cfg.backend_type),
         authentication=auth_method,
-        org_id=config.org_id if config.org_id else None
+        org_id=cfg.org_id if cfg.org_id else None,
+        monitor_agent_enabled=monitor_agent_enabled,
     )
 
     return True

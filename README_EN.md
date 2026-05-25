@@ -63,16 +63,15 @@ A Monitor MCP Server based on the [MCP (Model Context Protocol)](https://modelco
 ```bash
 git clone <repo-url> && cd monitor-mcp-server
 
-# Install dependencies (uv recommended)
-pip install uv
-uv pip install --system .
+# Install dependencies (install uv first: https://docs.astral.sh/uv/getting-started/installation/)
+uv sync
 
 # Configure
 cp env.example .env
 # Edit .env — at minimum set PROMETHEUS_URL
 
 # Start
-python main.py
+uv run monitor-mcp-server
 ```
 
 All configuration is provided via the `.env` file or environment variables; see the table above.
@@ -378,13 +377,13 @@ spec:
 
 ```bash
 # Install with dev dependencies
-uv pip install --system -e ".[dev]"
+uv sync --extra dev
 
 # Run tests
-pytest
+uv run --extra dev python -m pytest
 
 # With coverage
-pytest --cov=src --cov-report=term-missing
+uv run --extra dev python -m pytest --cov=src --cov-report=term-missing
 ```
 
 ### Project Structure
