@@ -55,6 +55,7 @@ CLAUDE.md
 
 # Cursor
 .cursor/
+.worktrees/
 
 # Security scan results
 trivy*.json

@@ -17,6 +17,7 @@ MAX_PAGE_SIZE = 500
 MAX_QUERY_LENGTH = 10000
 DEFAULT_LABEL_SAMPLE_SIZE = 10
 MAX_LABEL_SAMPLE_SIZE = 100
+DEFAULT_MONITOR_AGENT_RELOAD_TIMEOUT = 10
 
 RETRY_MAX_ATTEMPTS = 3  # 最大重试次数（不含首次请求），总请求次数 = 1 + RETRY_MAX_ATTEMPTS
 RETRY_BASE_DELAY = 0.5
@@ -72,6 +73,30 @@ def get_api_prefix(backend: str) -> str:
     return "/api/v1"
 
 
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    """解析常见布尔环境变量值。"""
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_csv(value: Optional[str], default: tuple[str, ...]) -> tuple[str, ...]:
+    """解析逗号分隔环境变量，过滤空值。"""
+    if not value:
+        return default
+    items = tuple(item.strip() for item in value.split(",") if item.strip())
+    return items or default
+
+
+def _safe_parse_int(value: Optional[str], default: int, name: str) -> int:
+    """安全解析整数环境变量，非法值回退到默认值并记录警告。"""
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        logging.warning("%s 不是有效整数 (%s)，使用默认值 %d", name, value, default)
+        return default
+
+
 @dataclass
 class MCPServerConfig:
     """MCP 服务器传输配置。"""
@@ -90,6 +115,25 @@ class MCPServerConfig:
 
 
 @dataclass
+class MonitorAgentConfig:
+    """monitor-agent 采集配置管理功能配置。"""
+    enabled: bool = False
+    s3_endpoint_url: Optional[str] = None
+    s3_bucket: Optional[str] = None
+    s3_access_key_id: Optional[str] = None
+    s3_secret_access_key: Optional[str] = None
+    s3_region: str = "us-east-1"
+    s3_addressing_style: str = "path"
+    config_prefix: str = "monitor-agent/configs"
+    backup_prefix: str = "monitor-agent/backups"
+    config_extension: str = ".yaml"
+    asset_query_template: str = 'up{instance=~"{ip}(:.*)?"}'
+    asset_id_labels: tuple[str, ...] = ("asset_id", "asset_no", "host_id", "hostname")
+    reload_url_template: str = "http://{ip}:12345/reload"
+    reload_timeout: int = DEFAULT_MONITOR_AGENT_RELOAD_TIMEOUT
+
+
+@dataclass
 class PrometheusConfig:
     """后端连接配置。
 
@@ -104,6 +148,7 @@ class PrometheusConfig:
     token: Optional[str] = None
     org_id: Optional[str] = None
     mcp_server_config: Optional[MCPServerConfig] = None
+    monitor_agent: Optional[MonitorAgentConfig] = None
 
 
 def _safe_parse_port(value: str, default: int = 8000) -> int:
@@ -131,5 +176,34 @@ config = PrometheusConfig(
         mcp_server_transport=os.environ.get("PROMETHEUS_MCP_SERVER_TRANSPORT", "stdio").lower(),
         mcp_bind_host=os.environ.get("PROMETHEUS_MCP_BIND_HOST", "127.0.0.1"),
         mcp_bind_port=_safe_parse_port(os.environ.get("PROMETHEUS_MCP_BIND_PORT", "8000"))
+    ),
+    monitor_agent=MonitorAgentConfig(
+        enabled=_parse_bool(os.environ.get("MONITOR_AGENT_CONFIG_ENABLED"), False),
+        s3_endpoint_url=os.environ.get("MONITOR_AGENT_S3_ENDPOINT_URL"),
+        s3_bucket=os.environ.get("MONITOR_AGENT_S3_BUCKET"),
+        s3_access_key_id=os.environ.get("MONITOR_AGENT_S3_ACCESS_KEY_ID"),
+        s3_secret_access_key=os.environ.get("MONITOR_AGENT_S3_SECRET_ACCESS_KEY"),
+        s3_region=os.environ.get("MONITOR_AGENT_S3_REGION", "us-east-1"),
+        s3_addressing_style=os.environ.get("MONITOR_AGENT_S3_ADDRESSING_STYLE", "path"),
+        config_prefix=os.environ.get("MONITOR_AGENT_CONFIG_PREFIX", "monitor-agent/configs"),
+        backup_prefix=os.environ.get("MONITOR_AGENT_BACKUP_PREFIX", "monitor-agent/backups"),
+        config_extension=os.environ.get("MONITOR_AGENT_CONFIG_EXTENSION", ".yaml"),
+        asset_query_template=os.environ.get(
+            "MONITOR_AGENT_ASSET_QUERY_TEMPLATE",
+            'up{instance=~"{ip}(:.*)?"}',
+        ),
+        asset_id_labels=_parse_csv(
+            os.environ.get("MONITOR_AGENT_ASSET_ID_LABELS"),
+            ("asset_id", "asset_no", "host_id", "hostname"),
+        ),
+        reload_url_template=os.environ.get(
+            "MONITOR_AGENT_RELOAD_URL_TEMPLATE",
+            "http://{ip}:12345/reload",
+        ),
+        reload_timeout=_safe_parse_int(
+            os.environ.get("MONITOR_AGENT_RELOAD_TIMEOUT"),
+            DEFAULT_MONITOR_AGENT_RELOAD_TIMEOUT,
+            "MONITOR_AGENT_RELOAD_TIMEOUT",
+        ),
     )
 )

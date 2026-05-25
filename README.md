@@ -24,6 +24,7 @@
 | `get_rules` | 获取所有告警规则和记录规则（支持 RULER_URL 路由） |
 | `get_targets` | 获取所有抓取目标的健康状态 |
 | `health_check` | 服务自身健康检查（含后端连通性检测） |
+| `monitor_agent_*` | 可选功能：管理 S3 兼容对象存储中的 monitor-agent 采集配置并触发 reload |
 
 ---
 
@@ -45,6 +46,27 @@
 | `PROMETHEUS_MCP_BIND_PORT` | SSE / streamable-http 模式绑定端口 | | `8000` |
 | `LOG_LEVEL` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` | | `INFO` |
 
+#### monitor-agent 配置管理（可选）
+
+默认关闭，只有设置 `MONITOR_AGENT_CONFIG_ENABLED=true` 后才会注册 `monitor_agent_*` 工具，不影响现有指标查询工具。
+
+| 变量 | 说明 | 必填 | 默认值 |
+|------|------|:----:|--------|
+| `MONITOR_AGENT_CONFIG_ENABLED` | 是否启用 monitor-agent 配置管理工具 | | `false` |
+| `MONITOR_AGENT_S3_ENDPOINT_URL` | S3 兼容对象存储地址 | 启用后 ✅ | — |
+| `MONITOR_AGENT_S3_BUCKET` | 配置文件所在 bucket | 启用后 ✅ | — |
+| `MONITOR_AGENT_S3_ACCESS_KEY_ID` | S3 Access Key | 启用后 ✅ | — |
+| `MONITOR_AGENT_S3_SECRET_ACCESS_KEY` | S3 Secret Key | 启用后 ✅ | — |
+| `MONITOR_AGENT_S3_REGION` | S3 Region | | `us-east-1` |
+| `MONITOR_AGENT_S3_ADDRESSING_STYLE` | S3 地址风格：`path` / `virtual` | | `path` |
+| `MONITOR_AGENT_CONFIG_PREFIX` | 配置文件目录前缀 | | `monitor-agent/configs` |
+| `MONITOR_AGENT_BACKUP_PREFIX` | 修改/删除前备份目录前缀 | | `monitor-agent/backups` |
+| `MONITOR_AGENT_CONFIG_EXTENSION` | 通过资产编号生成文件名时使用的扩展名 | | `.yaml` |
+| `MONITOR_AGENT_ASSET_QUERY_TEMPLATE` | 通过 IP 查询资产编号的 PromQL 模板，`{ip}` 会被替换 | | `up{instance=~"{ip}(:.*)?"}` |
+| `MONITOR_AGENT_ASSET_ID_LABELS` | 候选资产编号标签，按顺序匹配 | | `asset_id,asset_no,host_id,hostname` |
+| `MONITOR_AGENT_RELOAD_URL_TEMPLATE` | monitor-agent reload URL 模板 | | `http://{ip}:12345/reload` |
+| `MONITOR_AGENT_RELOAD_TIMEOUT` | reload 请求超时时间（秒） | | `10` |
+
 ### 后端适配速查
 
 | 后端 | `BACKEND_TYPE` | `PROMETHEUS_URL` | `RULER_URL` | 其他 |
@@ -64,16 +86,15 @@
 # 克隆项目
 git clone <repo-url> && cd monitor-mcp-server
 
-# 安装依赖（推荐 uv）
-pip install uv
-uv pip install --system .
+# 安装依赖（需先安装 uv，见 https://docs.astral.sh/uv/getting-started/installation/）
+uv sync
 
 # 配置
 cp env.example .env
 # 编辑 .env，填入 PROMETHEUS_URL
 
 # 启动
-python main.py
+uv run monitor-mcp-server
 ```
 
 所有配置通过 `.env` 文件或环境变量传入，详见上方环境变量表格。
@@ -330,6 +351,65 @@ kubectl get pods -l app.kubernetes.io/name=monitor-mcp-server
 }
 ```
 
+### `monitor_agent_resolve_asset`
+
+可选工具，需 `MONITOR_AGENT_CONFIG_ENABLED=true`。根据机器 IP 执行 `MONITOR_AGENT_ASSET_QUERY_TEMPLATE`，从返回序列的标签中按 `MONITOR_AGENT_ASSET_ID_LABELS` 顺序提取资产编号。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `ip` | string | ✅ | 机器 IP |
+
+### `monitor_agent_list_configs`
+
+列出 S3 兼容对象存储中配置目录下的 YAML 对象。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `prefix` | string | | 在配置目录下继续限定子前缀 |
+| `page` | int | | 页码，从 1 开始（默认 1） |
+| `page_size` | int | | 每页条数（默认 50，上限 500，设为 0 返回全部） |
+
+### `monitor_agent_get_config`
+
+读取 monitor-agent 配置。目标定位优先级为 `filename` > `asset_id` > `ip`；使用 `ip` 时会先查询资产编号。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `filename` | string | | 配置目录下的相对文件名 |
+| `asset_id` | string | | 资产编号，文件名默认为 `{asset_id}.yaml` |
+| `ip` | string | | 机器 IP |
+
+### `monitor_agent_put_config`
+
+创建或更新 monitor-agent YAML 配置。若目标对象已存在，会先复制到备份目录；备份失败时不会写入新内容。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `content` | string | ✅ | YAML 配置内容 |
+| `filename` | string | | 配置目录下的相对文件名 |
+| `asset_id` | string | | 资产编号，文件名默认为 `{asset_id}.yaml` |
+| `ip` | string | | 机器 IP |
+| `reload` | bool | | 写入后是否调用 monitor-agent `/reload`；为 true 时必须提供 `ip` |
+
+### `monitor_agent_delete_config`
+
+删除 monitor-agent YAML 配置。删除前会先复制到备份目录；备份失败时不会删除原文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `filename` | string | | 配置目录下的相对文件名 |
+| `asset_id` | string | | 资产编号，文件名默认为 `{asset_id}.yaml` |
+| `ip` | string | | 机器 IP |
+| `reload` | bool | | 删除后是否调用 monitor-agent `/reload`；为 true 时必须提供 `ip` |
+
+### `monitor_agent_reload`
+
+调用 `MONITOR_AGENT_RELOAD_URL_TEMPLATE` 展开后的 monitor-agent `/reload` 接口。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|:----:|------|
+| `ip` | string | ✅ | 机器 IP |
+
 ---
 
 ## 认证说明
@@ -374,13 +454,13 @@ spec:
 
 ```bash
 # 安装依赖（含开发依赖）
-uv pip install --system -e ".[dev]"
+uv sync --extra dev
 
 # 运行测试
-pytest
+uv run --extra dev python -m pytest
 
 # 带覆盖率
-pytest --cov=src --cov-report=term-missing
+uv run --extra dev python -m pytest --cov=src --cov-report=term-missing
 ```
 
 ### 项目结构
@@ -390,6 +470,7 @@ main.py                              # 启动入口
 src/monitor_mcp_server/
   config.py                          # 配置定义（环境变量、常量、数据类）
   client.py                          # HTTP 客户端（请求、重试、认证、配置校验）
+  monitor_agent.py                   # monitor-agent 配置管理（S3、备份、reload）
   tools.py                           # MCP 工具定义与服务器启动
   logging_config.py                  # 结构化日志配置
 tests/                               # 测试用例

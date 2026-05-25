@@ -23,6 +23,11 @@ from monitor_mcp_server.logging_config import setup_logging, get_logger
 mcp = FastMCP("Monitor MCP")
 logger = get_logger()
 
+if config.monitor_agent and config.monitor_agent.enabled:
+    from monitor_mcp_server.monitor_agent import register_monitor_agent_tools
+
+    register_monitor_agent_tools(mcp)
+
 
 def _get_ruler_url() -> Optional[str]:
     """获取告警/规则查询地址。
