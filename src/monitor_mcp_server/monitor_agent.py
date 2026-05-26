@@ -1,6 +1,7 @@
 """monitor-agent 采集配置管理能力。"""
 
 import asyncio
+import ipaddress
 import posixpath
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath, PureWindowsPath
@@ -13,6 +14,25 @@ from monitor_mcp_server.config import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MonitorA
 from monitor_mcp_server.logging_config import get_logger
 
 logger = get_logger()
+
+
+def _is_s3_not_found_error(exc: BaseException) -> bool:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str(response.get("Error", {}).get("Code", "")).lower()
+        return code in {"404", "nosuchkey", "notfound", "not found"}
+    return False
+
+
+def _normalize_ip(ip: Optional[str]) -> str:
+    ip_value = ip.strip() if ip else ""
+    if not ip_value:
+        raise ValueError("ip 不能为空")
+    try:
+        ipaddress.ip_address(ip_value)
+    except ValueError as exc:
+        raise ValueError("ip 参数必须是有效 IP 地址") from exc
+    return ip_value
 
 
 def _classify_error(exc: BaseException) -> str:
@@ -113,10 +133,12 @@ async def resolve_asset_id(
 ) -> Dict[str, Any]:
     """根据机器 IP 查询 Prometheus 指标标签中的资产编号。"""
     cfg = agent_config or config.monitor_agent or MonitorAgentConfig()
-    if not ip or not ip.strip():
-        return build_error_response("ip 不能为空", error_type="client")
+    try:
+        ip_value = _normalize_ip(ip)
+    except ValueError as exc:
+        return build_error_response(str(exc), error_type="client")
 
-    query = cfg.asset_query_template.replace("{ip}", ip.strip())
+    query = cfg.asset_query_template.replace("{ip}", ip_value)
 
     try:
         data = await make_prometheus_request("query", params={"query": query})
@@ -148,7 +170,7 @@ async def resolve_asset_id(
         asset_id, match = next(iter(found.items()))
         return {
             "status": "success",
-            "ip": ip.strip(),
+            "ip": ip_value,
             "asset_id": asset_id,
             "asset_label": match["asset_label"],
             "query": query,
@@ -237,16 +259,18 @@ class MonitorAgentService:
             return resolved
         return build_error_response("必须提供 filename、asset_id 或 ip", error_type="client")
 
-    async def _object_exists(self, key: str) -> bool:
+    async def _object_state(self, key: str) -> Dict[str, Any]:
         try:
             await asyncio.to_thread(
                 self.s3_client.head_object,
                 Bucket=self.config.s3_bucket,
                 Key=key,
             )
-            return True
-        except Exception:
-            return False
+            return {"status": "exists"}
+        except Exception as exc:
+            if _is_s3_not_found_error(exc):
+                return {"status": "missing"}
+            return build_error_response(str(exc), error_type="upstream", key=key)
 
     async def _backup_existing(self, key: str) -> Dict[str, Any]:
         try:
@@ -398,7 +422,10 @@ class MonitorAgentService:
         backed_up = False
         backup_key = None
         backup_retention = None
-        if await self._object_exists(target["key"]):
+        object_state = await self._object_state(target["key"])
+        if object_state.get("status") == "error":
+            return object_state
+        if object_state.get("status") == "exists":
             backup = await self._backup_existing(target["key"])
             if backup.get("status") == "error":
                 return backup
@@ -442,7 +469,10 @@ class MonitorAgentService:
         target = await self._resolve_filename(ip=ip, asset_id=asset_id, filename=filename)
         if target.get("status") == "error":
             return target
-        if not await self._object_exists(target["key"]):
+        object_state = await self._object_state(target["key"])
+        if object_state.get("status") == "error":
+            return object_state
+        if object_state.get("status") == "missing":
             return build_error_response("配置文件不存在", error_type="client", key=target["key"])
 
         backup = await self._backup_existing(target["key"])
@@ -469,9 +499,11 @@ class MonitorAgentService:
         return response
 
     async def reload(self, ip: str) -> Dict[str, Any]:
-        if not ip or not ip.strip():
-            return build_error_response("ip 不能为空", error_type="client")
-        url = self.config.reload_url_template.replace("{ip}", ip.strip())
+        try:
+            ip_value = _normalize_ip(ip)
+        except ValueError as exc:
+            return build_error_response(str(exc), error_type="client")
+        url = self.config.reload_url_template.replace("{ip}", ip_value)
 
         try:
             async with httpx.AsyncClient(timeout=self.config.reload_timeout) as client:
@@ -479,7 +511,7 @@ class MonitorAgentService:
                 response.raise_for_status()
             return {
                 "status": "success",
-                "ip": ip.strip(),
+                "ip": ip_value,
                 "url": url,
                 "status_code": response.status_code,
             }

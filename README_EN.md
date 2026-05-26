@@ -24,6 +24,7 @@ A Monitor MCP Server based on the [MCP (Model Context Protocol)](https://modelco
 | `get_rules` | Get all alerting & recording rules (routes via `RULER_URL` if configured) |
 | `get_targets` | Get scrape target health status |
 | `health_check` | Server health check including backend connectivity |
+| `monitor_agent_*` | Optional: manage monitor-agent collection configs in S3-compatible storage and trigger reload |
 
 ---
 
@@ -44,6 +45,29 @@ A Monitor MCP Server based on the [MCP (Model Context Protocol)](https://modelco
 | `PROMETHEUS_MCP_BIND_HOST` | Bind address for SSE / streamable-http | | `127.0.0.1` |
 | `PROMETHEUS_MCP_BIND_PORT` | Bind port for SSE / streamable-http | | `8000` |
 | `LOG_LEVEL` | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` | | `INFO` |
+
+#### monitor-agent Config Management (optional)
+
+Disabled by default. Set `MONITOR_AGENT_CONFIG_ENABLED=true` to register `monitor_agent_*` tools. Existing metric query tools are unchanged when this feature is disabled.
+
+| Variable | Description | Required | Default |
+|----------|-------------|:--------:|---------|
+| `MONITOR_AGENT_CONFIG_ENABLED` | Enable monitor-agent config management tools | | `false` |
+| `MONITOR_AGENT_S3_ENDPOINT_URL` | S3-compatible object storage endpoint | when enabled ✅ | — |
+| `MONITOR_AGENT_S3_BUCKET` | Bucket that stores config files | when enabled ✅ | — |
+| `MONITOR_AGENT_S3_ACCESS_KEY_ID` | S3 access key | when enabled ✅ | — |
+| `MONITOR_AGENT_S3_SECRET_ACCESS_KEY` | S3 secret key | when enabled ✅ | — |
+| `MONITOR_AGENT_S3_REGION` | S3 region | | `us-east-1` |
+| `MONITOR_AGENT_S3_ADDRESSING_STYLE` | S3 addressing style: `path` / `virtual` | | `path` |
+| `MONITOR_AGENT_CONFIG_PREFIX` | Config object prefix | | `monitor-agent/configs` |
+| `MONITOR_AGENT_BACKUP_PREFIX` | Backup object prefix; backups are written directly under this prefix and must not equal, contain, or be contained by the config prefix | | `monitor-agent/backups` |
+| `MONITOR_AGENT_BACKUP_TIMEZONE` | Backup filename timestamp timezone, e.g. `UTC` or `+08:00` | | `+08:00` |
+| `MONITOR_AGENT_BACKUP_RETENTION_DAYS` | Backup retention days, based on S3 `LastModified` | | `180` |
+| `MONITOR_AGENT_CONFIG_EXTENSION` | Extension used when deriving filenames from asset IDs | | `.yaml` |
+| `MONITOR_AGENT_ASSET_QUERY_TEMPLATE` | PromQL template for resolving asset IDs from IP; `{ip}` is replaced with the input IP | | `up{instance=~"{ip}(:.*)?"}` |
+| `MONITOR_AGENT_ASSET_ID_LABELS` | Candidate asset ID labels, checked in order | | `asset_id,asset_no,host_id,hostname` |
+| `MONITOR_AGENT_RELOAD_URL_TEMPLATE` | monitor-agent reload URL template | | `http://{ip}:12345/reload` |
+| `MONITOR_AGENT_RELOAD_TIMEOUT` | Reload request timeout in seconds | | `10` |
 
 ### Backend Adaptation Cheat Sheet
 
@@ -333,6 +357,65 @@ Response fields:
 }
 ```
 
+### `monitor_agent_resolve_asset`
+
+Optional tool, requires `MONITOR_AGENT_CONFIG_ENABLED=true`. Runs `MONITOR_AGENT_ASSET_QUERY_TEMPLATE` for the given machine IP and extracts the asset ID from returned metric labels according to `MONITOR_AGENT_ASSET_ID_LABELS`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `ip` | string | ✅ | Machine IP address |
+
+### `monitor_agent_list_configs`
+
+Lists YAML config objects under the configured S3-compatible storage prefix.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `prefix` | string | | Additional sub-prefix under the config prefix |
+| `page` | int | | Page number, starting from 1 (default 1) |
+| `page_size` | int | | Items per page (default 50, max 500; set to 0 for all) |
+
+### `monitor_agent_get_config`
+
+Reads a monitor-agent config. Target resolution priority is `filename` > `asset_id` > `ip`; when `ip` is used, the asset ID is resolved first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `filename` | string | | Relative filename under the config prefix |
+| `asset_id` | string | | Asset ID; filename defaults to `{asset_id}.yaml` |
+| `ip` | string | | Machine IP address |
+
+### `monitor_agent_put_config`
+
+Creates or updates a monitor-agent YAML config. If the target object already exists, it is copied to the backup prefix before the new content is written. If backup fails, the write is aborted. Backup keys use `{MONITOR_AGENT_BACKUP_PREFIX}/{configured-timezone-timestamp}-{original-filename}`. After each successful backup, expired backups are cleaned according to `MONITOR_AGENT_BACKUP_RETENTION_DAYS` and S3 `LastModified`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `content` | string | ✅ | YAML config content |
+| `filename` | string | | Relative filename under the config prefix |
+| `asset_id` | string | | Asset ID; filename defaults to `{asset_id}.yaml` |
+| `ip` | string | | Machine IP address |
+| `reload` | bool | | Call monitor-agent `/reload` after writing; requires the `ip` parameter |
+
+### `monitor_agent_delete_config`
+
+Deletes a monitor-agent YAML config. The existing object is copied to the backup prefix before deletion. If backup fails, deletion is aborted. Backup key format is the same as `monitor_agent_put_config`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `filename` | string | | Relative filename under the config prefix |
+| `asset_id` | string | | Asset ID; filename defaults to `{asset_id}.yaml` |
+| `ip` | string | | Machine IP address |
+| `reload` | bool | | Call monitor-agent `/reload` after deletion; requires the `ip` parameter |
+
+### `monitor_agent_reload`
+
+Calls the monitor-agent `/reload` endpoint produced from `MONITOR_AGENT_RELOAD_URL_TEMPLATE`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `ip` | string | ✅ | Machine IP address |
+
 ---
 
 ## Authentication
@@ -393,9 +476,11 @@ main.py                              # Entry point
 src/monitor_mcp_server/
   config.py                          # Configuration (env vars, constants, dataclasses)
   client.py                          # HTTP client (requests, retry, auth, validation)
+  monitor_agent.py                   # Optional monitor-agent config management
   tools.py                           # MCP tool definitions & server startup
   logging_config.py                  # Structured logging
 tests/                               # Test suite
+  test_monitor_agent.py              # monitor-agent config management tests
 skills/                              # AI assistant query skills
 ```
 
