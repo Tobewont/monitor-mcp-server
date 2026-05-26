@@ -1,6 +1,6 @@
 # Monitor MCP Server
 
-python license
+![python](https://img.shields.io/badge/python-3.12%2B-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 **[English](README_EN.md)** | 中文
 
@@ -65,7 +65,7 @@ python license
 | `MONITOR_AGENT_S3_REGION`            | S3 Region                           |       | `us-east-1`                          |
 | `MONITOR_AGENT_S3_ADDRESSING_STYLE`  | S3 地址风格：`path` / `virtual`          |       | `path`                               |
 | `MONITOR_AGENT_CONFIG_PREFIX`        | 配置文件目录前缀                            |       | `monitor-agent/configs`              |
-| `MONITOR_AGENT_BACKUP_PREFIX`        | 修改/删除前备份目录前缀，备份文件会直接写入该前缀下 |       | `monitor-agent/backups`              |
+| `MONITOR_AGENT_BACKUP_PREFIX`        | 修改/删除前备份目录前缀，备份文件会直接写入该前缀下，不能与配置前缀相同或互为父子目录 |       | `monitor-agent/backups`              |
 | `MONITOR_AGENT_BACKUP_TIMEZONE`      | 备份文件时间戳时区，支持 `UTC` 或 `+08:00` 等格式 |       | `+08:00`                             |
 | `MONITOR_AGENT_BACKUP_RETENTION_DAYS` | 备份文件保留天数，按 S3 `LastModified` 判断过期 |       | `180`                                |
 | `MONITOR_AGENT_CONFIG_EXTENSION`     | 通过资产编号生成文件名时使用的扩展名                  |       | `.yaml`                              |
@@ -140,7 +140,8 @@ docker build -t monitor-mcp-server .
 
 ## MCP 客户端接入
 
-**Claude Desktop / VS Code / Cursor**
+<details>
+<summary><b>Claude Desktop / VS Code / Cursor</b></summary>
 
 ```json
 {
@@ -173,9 +174,12 @@ docker build -t monitor-mcp-server .
 }
 ```
 
+</details>
 
 
-**Docker Compose**
+
+<details>
+<summary><b>Docker Compose</b></summary>
 
 ```yaml
 version: '3.8'
@@ -196,9 +200,12 @@ services:
       retries: 3
 ```
 
+</details>
 
 
-**Kubernetes**
+
+<details>
+<summary><b>Kubernetes</b></summary>
 
 项目提供了基础的 K8s 部署方案（Deployment、Service、Secret），其他资源（Namespace、ConfigMap、Ingress、HPA）以内联示例形式在 k8s/README.md 中提供。
 
@@ -213,6 +220,8 @@ kubectl apply -f k8s/
 # 验证
 kubectl get pods -l app.kubernetes.io/name=monitor-mcp-server
 ```
+
+</details>
 
 
 

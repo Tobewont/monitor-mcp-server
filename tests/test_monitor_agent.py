@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import httpx
+from botocore.exceptions import ClientError
 from fastmcp import Client, FastMCP
 
 from monitor_mcp_server.config import MonitorAgentConfig, PrometheusConfig
@@ -37,6 +38,23 @@ def test_setup_environment_rejects_invalid_backup_timezone():
             s3_access_key_id="access",
             s3_secret_access_key="secret",
             backup_timezone="Asia/Shanghai",
+        ),
+    )
+
+    assert setup_environment(cfg) is False
+
+
+def test_setup_environment_rejects_overlapping_backup_prefix():
+    cfg = PrometheusConfig(
+        url="http://prometheus.example",
+        monitor_agent=MonitorAgentConfig(
+            enabled=True,
+            s3_endpoint_url="https://s3.example.com",
+            s3_bucket="bucket",
+            s3_access_key_id="access",
+            s3_secret_access_key="secret",
+            config_prefix="monitor-agent/remote_configs",
+            backup_prefix="monitor-agent",
         ),
     )
 
@@ -98,6 +116,15 @@ async def test_resolve_asset_id_rejects_conflicting_assets(monkeypatch):
     assert "多个资产编号" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_resolve_asset_id_rejects_invalid_ip():
+    result = await resolve_asset_id('10.0.0.1"|.*', MonitorAgentConfig(enabled=True))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "client"
+    assert "ip 参数必须是有效 IP 地址" in result["error"]
+
+
 def test_validate_monitor_agent_yaml_rejects_invalid_yaml():
     result = validate_monitor_agent_yaml("scrape_configs: [")
 
@@ -114,17 +141,20 @@ class FakeBody:
 
 
 class FakeS3Client:
-    def __init__(self, existing=None, fail_copy=False, last_modified=None):
+    def __init__(self, existing=None, fail_copy=False, last_modified=None, head_error=None):
         self.objects = dict(existing or {})
         self.last_modified = dict(last_modified or {})
         self.fail_copy = fail_copy
+        self.head_error = head_error
         self.copied = []
         self.puts = []
         self.deletes = []
 
     def head_object(self, Bucket, Key):
+        if self.head_error:
+            raise self.head_error
         if Key not in self.objects:
-            raise Exception("not found")
+            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
         return {}
 
     def copy_object(self, Bucket, CopySource, Key):
@@ -343,6 +373,18 @@ async def test_put_config_stops_when_backup_fails():
     result = await service.put_config(content="new: true\n", asset_id="asset-001")
 
     assert result["status"] == "error"
+    assert not s3.puts
+
+
+@pytest.mark.asyncio
+async def test_put_config_stops_when_head_object_fails():
+    s3 = FakeS3Client(head_error=RuntimeError("network down"))
+    service = make_service(s3)
+
+    result = await service.put_config(content="new: true\n", asset_id="asset-001")
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "upstream"
     assert not s3.puts
 
 

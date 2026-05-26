@@ -340,6 +340,12 @@ def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
     """
     cfg = active_config or config
 
+    def _clean_prefix(value: str) -> str:
+        return (value or "").strip().strip("/")
+
+    def _is_same_or_nested_prefix(left: str, right: str) -> bool:
+        return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
+
     if dotenv.find_dotenv():
         logger.info("环境配置已加载", source=".env 文件")
     else:
@@ -445,6 +451,21 @@ def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
             logger.error(
                 "MONITOR_AGENT_RELOAD_URL_TEMPLATE 无效",
                 error="模板必须包含 {ip} 占位符",
+            )
+            return False
+        config_prefix = _clean_prefix(monitor_agent.config_prefix)
+        backup_prefix = _clean_prefix(monitor_agent.backup_prefix)
+        if not config_prefix:
+            logger.error("MONITOR_AGENT_CONFIG_PREFIX 不能为空")
+            return False
+        if not backup_prefix:
+            logger.error("MONITOR_AGENT_BACKUP_PREFIX 不能为空")
+            return False
+        if _is_same_or_nested_prefix(config_prefix, backup_prefix):
+            logger.error(
+                "MONITOR_AGENT_BACKUP_PREFIX 与 MONITOR_AGENT_CONFIG_PREFIX 不能相同或互为父子目录",
+                config_prefix=config_prefix,
+                backup_prefix=backup_prefix,
             )
             return False
         backup_timezone = monitor_agent.backup_timezone.strip()
