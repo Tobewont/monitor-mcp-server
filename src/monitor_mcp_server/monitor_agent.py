@@ -2,7 +2,7 @@
 
 import asyncio
 import posixpath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Optional
 
@@ -60,11 +60,38 @@ def _filename_from_asset(asset_id: str, extension: str) -> str:
     return f"{asset}{suffix}"
 
 
-def _backup_key(agent_config: MonitorAgentConfig, key: str) -> str:
+def _parse_backup_timezone(value: str) -> timezone:
+    raw = (value or "+08:00").strip()
+    if raw.upper() in ("UTC", "Z", "+00:00", "-00:00"):
+        return timezone.utc
+
+    sign = 1
+    if raw.startswith("+"):
+        raw = raw[1:]
+    elif raw.startswith("-"):
+        sign = -1
+        raw = raw[1:]
+    else:
+        raise ValueError("MONITOR_AGENT_BACKUP_TIMEZONE 必须是 UTC 或 +/-HH:MM 格式")
+
+    try:
+        hours_text, minutes_text = raw.split(":", 1)
+        hours = int(hours_text)
+        minutes = int(minutes_text)
+    except ValueError as exc:
+        raise ValueError("MONITOR_AGENT_BACKUP_TIMEZONE 必须是 UTC 或 +/-HH:MM 格式") from exc
+
+    if hours > 23 or minutes > 59:
+        raise ValueError("MONITOR_AGENT_BACKUP_TIMEZONE 超出有效范围")
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def build_backup_key(agent_config: MonitorAgentConfig, key: str) -> str:
+    """构造备份对象 key，时间戳使用配置的时区。"""
     filename = posixpath.basename(key)
-    parent = posixpath.basename(posixpath.dirname(key)) or "root"
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return _object_key(agent_config.backup_prefix, f"{parent}/{timestamp}-{filename}")
+    backup_tz = _parse_backup_timezone(agent_config.backup_timezone)
+    timestamp = datetime.now(timezone.utc).astimezone(backup_tz).strftime("%Y%m%dT%H%M%S%z")
+    return _object_key(agent_config.backup_prefix, f"{timestamp}-{filename}")
 
 
 def validate_monitor_agent_yaml(content: str) -> Dict[str, Any]:
@@ -147,7 +174,14 @@ def build_s3_client(agent_config: MonitorAgentConfig):
         aws_access_key_id=agent_config.s3_access_key_id,
         aws_secret_access_key=agent_config.s3_secret_access_key,
         region_name=agent_config.s3_region,
-        config=Config(s3={"addressing_style": agent_config.s3_addressing_style}),
+        config=Config(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+            s3={
+                "addressing_style": agent_config.s3_addressing_style,
+                "payload_signing_enabled": False,
+            },
+        ),
     )
 
 
@@ -215,7 +249,10 @@ class MonitorAgentService:
             return False
 
     async def _backup_existing(self, key: str) -> Dict[str, Any]:
-        backup_key = _backup_key(self.config, key)
+        try:
+            backup_key = build_backup_key(self.config, key)
+        except ValueError as exc:
+            return build_error_response(str(exc), error_type="client")
         try:
             await asyncio.to_thread(
                 self.s3_client.copy_object,
@@ -223,9 +260,56 @@ class MonitorAgentService:
                 CopySource={"Bucket": self.config.s3_bucket, "Key": key},
                 Key=backup_key,
             )
-            return {"status": "success", "backup_key": backup_key}
+            cleanup = await self.cleanup_expired_backups()
+            return {
+                "status": "success",
+                "backup_key": backup_key,
+                "backup_retention": cleanup,
+            }
         except Exception as exc:
             return build_error_response(f"备份原配置失败: {exc}", error_type="upstream")
+
+    async def cleanup_expired_backups(self) -> Dict[str, Any]:
+        """删除超过保留天数的备份对象，基于 S3 LastModified。"""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.config.backup_retention_days)
+        backup_prefix = _strip_slashes(self.config.backup_prefix)
+        deleted: list[str] = []
+        try:
+            token = None
+            while True:
+                kwargs = {"Bucket": self.config.s3_bucket, "Prefix": backup_prefix}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                response = await asyncio.to_thread(self.s3_client.list_objects_v2, **kwargs)
+                for item in response.get("Contents", []):
+                    key = item.get("Key")
+                    last_modified = item.get("LastModified")
+                    if not key or last_modified is None:
+                        continue
+                    if last_modified.tzinfo is None:
+                        last_modified = last_modified.replace(tzinfo=timezone.utc)
+                    if last_modified.astimezone(timezone.utc) < cutoff:
+                        await asyncio.to_thread(
+                            self.s3_client.delete_object,
+                            Bucket=self.config.s3_bucket,
+                            Key=key,
+                        )
+                        deleted.append(key)
+
+                if not response.get("IsTruncated"):
+                    break
+                token = response.get("NextContinuationToken")
+                if not token:
+                    break
+            return {
+                "status": "success",
+                "retention_days": self.config.backup_retention_days,
+                "expired_deleted": len(deleted),
+                "deleted_keys": deleted,
+            }
+        except Exception as exc:
+            logger.warning("monitor-agent 过期备份清理失败", error=str(exc))
+            return build_error_response(str(exc), error_type="upstream")
 
     async def list_configs(
         self,
@@ -313,19 +397,23 @@ class MonitorAgentService:
 
         backed_up = False
         backup_key = None
+        backup_retention = None
         if await self._object_exists(target["key"]):
             backup = await self._backup_existing(target["key"])
             if backup.get("status") == "error":
                 return backup
             backed_up = True
             backup_key = backup["backup_key"]
+            backup_retention = backup.get("backup_retention")
         try:
+            body = content.encode("utf-8")
             await asyncio.to_thread(
                 self.s3_client.put_object,
                 Bucket=self.config.s3_bucket,
                 Key=target["key"],
-                Body=content,
+                Body=body,
                 ContentType="application/x-yaml",
+                ContentLength=len(body),
             )
         except Exception as exc:
             return build_error_response(str(exc), error_type="upstream", key=target["key"])
@@ -335,6 +423,7 @@ class MonitorAgentService:
             **target,
             "backed_up": backed_up,
             "backup_key": backup_key,
+            "backup_retention": backup_retention,
         }
         if reload:
             response["reload"] = await self.reload(ip)
@@ -373,6 +462,7 @@ class MonitorAgentService:
             **target,
             "backed_up": True,
             "backup_key": backup["backup_key"],
+            "backup_retention": backup.get("backup_retention"),
         }
         if reload:
             response["reload"] = await self.reload(ip)
@@ -465,6 +555,7 @@ def register_monitor_agent_tools(mcp: Any) -> None:
 
 __all__ = [
     "MonitorAgentService",
+    "build_backup_key",
     "build_s3_client",
     "register_monitor_agent_tools",
     "resolve_asset_id",

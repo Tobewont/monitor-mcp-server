@@ -18,6 +18,7 @@ MAX_QUERY_LENGTH = 10000
 DEFAULT_LABEL_SAMPLE_SIZE = 10
 MAX_LABEL_SAMPLE_SIZE = 100
 DEFAULT_MONITOR_AGENT_RELOAD_TIMEOUT = 10
+DEFAULT_MONITOR_AGENT_BACKUP_RETENTION_DAYS = 180
 
 RETRY_MAX_ATTEMPTS = 3  # 最大重试次数（不含首次请求），总请求次数 = 1 + RETRY_MAX_ATTEMPTS
 RETRY_BASE_DELAY = 0.5
@@ -126,6 +127,8 @@ class MonitorAgentConfig:
     s3_addressing_style: str = "path"
     config_prefix: str = "monitor-agent/configs"
     backup_prefix: str = "monitor-agent/backups"
+    backup_timezone: str = "+08:00"
+    backup_retention_days: int = DEFAULT_MONITOR_AGENT_BACKUP_RETENTION_DAYS
     config_extension: str = ".yaml"
     asset_query_template: str = 'up{instance=~"{ip}(:.*)?"}'
     asset_id_labels: tuple[str, ...] = ("asset_id", "asset_no", "host_id", "hostname")
@@ -187,6 +190,12 @@ config = PrometheusConfig(
         s3_addressing_style=os.environ.get("MONITOR_AGENT_S3_ADDRESSING_STYLE", "path"),
         config_prefix=os.environ.get("MONITOR_AGENT_CONFIG_PREFIX", "monitor-agent/configs"),
         backup_prefix=os.environ.get("MONITOR_AGENT_BACKUP_PREFIX", "monitor-agent/backups"),
+        backup_timezone=os.environ.get("MONITOR_AGENT_BACKUP_TIMEZONE", "+08:00"),
+        backup_retention_days=_safe_parse_int(
+            os.environ.get("MONITOR_AGENT_BACKUP_RETENTION_DAYS"),
+            DEFAULT_MONITOR_AGENT_BACKUP_RETENTION_DAYS,
+            "MONITOR_AGENT_BACKUP_RETENTION_DAYS",
+        ),
         config_extension=os.environ.get("MONITOR_AGENT_CONFIG_EXTENSION", ".yaml"),
         asset_query_template=os.environ.get(
             "MONITOR_AGENT_ASSET_QUERY_TEMPLATE",
