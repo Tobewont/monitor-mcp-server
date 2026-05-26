@@ -1,5 +1,7 @@
 """Tests for monitor-agent configuration management."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 import httpx
 from fastmcp import Client, FastMCP
@@ -8,6 +10,8 @@ from monitor_mcp_server.config import MonitorAgentConfig, PrometheusConfig
 from monitor_mcp_server.client import setup_environment
 from monitor_mcp_server.monitor_agent import (
     MonitorAgentService,
+    build_backup_key,
+    build_s3_client,
     register_monitor_agent_tools,
     resolve_asset_id,
     validate_monitor_agent_yaml,
@@ -18,6 +22,22 @@ def test_setup_environment_requires_s3_settings_when_monitor_agent_enabled():
     cfg = PrometheusConfig(
         url="http://prometheus.example",
         monitor_agent=MonitorAgentConfig(enabled=True),
+    )
+
+    assert setup_environment(cfg) is False
+
+
+def test_setup_environment_rejects_invalid_backup_timezone():
+    cfg = PrometheusConfig(
+        url="http://prometheus.example",
+        monitor_agent=MonitorAgentConfig(
+            enabled=True,
+            s3_endpoint_url="https://s3.example.com",
+            s3_bucket="bucket",
+            s3_access_key_id="access",
+            s3_secret_access_key="secret",
+            backup_timezone="Asia/Shanghai",
+        ),
     )
 
     assert setup_environment(cfg) is False
@@ -94,8 +114,9 @@ class FakeBody:
 
 
 class FakeS3Client:
-    def __init__(self, existing=None, fail_copy=False):
+    def __init__(self, existing=None, fail_copy=False, last_modified=None):
         self.objects = dict(existing or {})
+        self.last_modified = dict(last_modified or {})
         self.fail_copy = fail_copy
         self.copied = []
         self.puts = []
@@ -111,14 +132,17 @@ class FakeS3Client:
             raise Exception("copy failed")
         self.copied.append((CopySource["Key"], Key))
         self.objects[Key] = self.objects[CopySource["Key"]]
+        self.last_modified[Key] = datetime.now(timezone.utc)
 
-    def put_object(self, Bucket, Key, Body, ContentType):
-        self.puts.append((Key, Body, ContentType))
+    def put_object(self, Bucket, Key, Body, ContentType, ContentLength=None):
+        self.puts.append((Key, Body, ContentType, ContentLength))
         self.objects[Key] = Body
+        self.last_modified[Key] = datetime.now(timezone.utc)
 
     def delete_object(self, Bucket, Key):
         self.deletes.append(Key)
         self.objects.pop(Key, None)
+        self.last_modified.pop(Key, None)
 
     def get_object(self, Bucket, Key):
         if Key not in self.objects:
@@ -128,7 +152,11 @@ class FakeS3Client:
     def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
         return {
             "Contents": [
-                {"Key": key, "Size": len(value)}
+                {
+                    "Key": key,
+                    "Size": len(value),
+                    "LastModified": self.last_modified.get(key),
+                }
                 for key, value in sorted(self.objects.items())
                 if key.startswith(Prefix)
             ],
@@ -148,6 +176,121 @@ def make_service(s3_client):
     )
 
 
+def test_build_s3_client_disables_aws_chunked_checksum(monkeypatch):
+    calls = []
+
+    class FakeBoto3:
+        @staticmethod
+        def client(*args, **kwargs):
+            calls.append((args, kwargs))
+            return object()
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", FakeBoto3)
+
+    cfg = MonitorAgentConfig(
+        enabled=True,
+        s3_endpoint_url="https://s3.example.com",
+        s3_access_key_id="access",
+        s3_secret_access_key="secret",
+        s3_addressing_style="path",
+    )
+
+    build_s3_client(cfg)
+
+    client_kwargs = calls[0][1]
+    botocore_config = client_kwargs["config"]
+    assert botocore_config.request_checksum_calculation == "when_required"
+    assert botocore_config.response_checksum_validation == "when_required"
+    assert botocore_config.s3["payload_signing_enabled"] is False
+
+
+def test_backup_key_uses_configured_timezone(monkeypatch):
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            from datetime import datetime
+
+            return datetime(2026, 5, 25, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr("monitor_mcp_server.monitor_agent.datetime", FixedDatetime)
+
+    backup_key = build_backup_key(
+        MonitorAgentConfig(
+            backup_prefix="monitor-agent/backups",
+            backup_timezone="+08:00",
+        ),
+        "monitor-agent/configs/asset-001.yaml",
+    )
+
+    assert backup_key == "monitor-agent/backups/20260525T200000+0800-asset-001.yaml"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_expired_backups_uses_last_modified():
+    old_key = "monitor-agent/backups/old.yaml"
+    fresh_key = "monitor-agent/backups/fresh.yaml"
+    config_key = "monitor-agent/configs/current.yaml"
+    now = datetime.now(timezone.utc)
+    s3 = FakeS3Client(
+        {
+            old_key: "old",
+            fresh_key: "fresh",
+            config_key: "current",
+        },
+        last_modified={
+            old_key: now - timedelta(days=181),
+            fresh_key: now - timedelta(days=10),
+            config_key: now - timedelta(days=300),
+        },
+    )
+    service = MonitorAgentService(
+        MonitorAgentConfig(
+            enabled=True,
+            s3_bucket="bucket",
+            backup_prefix="monitor-agent/backups",
+            backup_retention_days=180,
+        ),
+        s3_client=s3,
+    )
+
+    result = await service.cleanup_expired_backups()
+
+    assert result["status"] == "success"
+    assert result["expired_deleted"] == 1
+    assert s3.deletes == [old_key]
+    assert fresh_key in s3.objects
+    assert config_key in s3.objects
+
+
+@pytest.mark.asyncio
+async def test_put_config_cleans_expired_backups_after_backup():
+    old_backup = "monitor-agent/backups/old.yaml"
+    now = datetime.now(timezone.utc)
+    s3 = FakeS3Client(
+        {
+            "monitor-agent/configs/asset-001.yaml": "old: true\n",
+            old_backup: "old backup",
+        },
+        last_modified={old_backup: now - timedelta(days=181)},
+    )
+    service = MonitorAgentService(
+        MonitorAgentConfig(
+            enabled=True,
+            s3_bucket="bucket",
+            config_prefix="monitor-agent/configs",
+            backup_prefix="monitor-agent/backups",
+            backup_retention_days=180,
+        ),
+        s3_client=s3,
+    )
+
+    result = await service.put_config(content="new: true\n", asset_id="asset-001")
+
+    assert result["status"] == "success"
+    assert old_backup in s3.deletes
+    assert result["backup_retention"]["expired_deleted"] == 1
+
+
 @pytest.mark.asyncio
 async def test_put_config_backs_up_existing_object_before_write():
     s3 = FakeS3Client({"monitor-agent/configs/asset-001.yaml": "old: true\n"})
@@ -159,8 +302,34 @@ async def test_put_config_backs_up_existing_object_before_write():
     assert result["backed_up"] is True
     assert s3.copied[0][0] == "monitor-agent/configs/asset-001.yaml"
     assert s3.puts == [
-        ("monitor-agent/configs/asset-001.yaml", "new: true\n", "application/x-yaml")
+        (
+            "monitor-agent/configs/asset-001.yaml",
+            b"new: true\n",
+            "application/x-yaml",
+            len(b"new: true\n"),
+        )
     ]
+
+
+@pytest.mark.asyncio
+async def test_put_config_writes_backup_directly_under_backup_prefix():
+    s3 = FakeS3Client({"monitor-agent/remote_configs/asset-001.yaml": "old: true\n"})
+    service = MonitorAgentService(
+        MonitorAgentConfig(
+            enabled=True,
+            s3_bucket="bucket",
+            config_prefix="monitor-agent/remote_configs/",
+            backup_prefix="monitor-agent/remote_configs_backups/",
+        ),
+        s3_client=s3,
+    )
+
+    result = await service.put_config(content="new: true\n", asset_id="asset-001")
+
+    assert result["status"] == "success"
+    backup_key = s3.copied[0][1]
+    assert backup_key.startswith("monitor-agent/remote_configs_backups/")
+    assert "/remote_configs/" not in backup_key
 
 
 @pytest.mark.asyncio
@@ -229,9 +398,9 @@ async def test_reload_calls_monitor_agent_url(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_monitor_agent_tools_are_not_registered_by_default():
-    from monitor_mcp_server.tools import mcp
+    server = FastMCP("Monitor Agent Disabled Test")
 
-    async with Client(mcp) as client:
+    async with Client(server) as client:
         tools = await client.list_tools()
 
     tool_names = {tool.name for tool in tools}

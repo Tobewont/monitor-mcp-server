@@ -447,6 +447,19 @@ def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
                 error="模板必须包含 {ip} 占位符",
             )
             return False
+        backup_timezone = monitor_agent.backup_timezone.strip()
+        if backup_timezone.upper() not in ("UTC", "Z") and not (
+            len(backup_timezone) == 6
+            and backup_timezone[0] in ("+", "-")
+            and backup_timezone[3] == ":"
+            and backup_timezone[1:3].isdigit()
+            and backup_timezone[4:6].isdigit()
+        ):
+            logger.error(
+                "MONITOR_AGENT_BACKUP_TIMEZONE 无效",
+                error="必须是 UTC 或 +/-HH:MM 格式",
+            )
+            return False
         if monitor_agent.s3_addressing_style not in ("path", "virtual"):
             logger.error(
                 "MONITOR_AGENT_S3_ADDRESSING_STYLE 无效",
@@ -455,6 +468,9 @@ def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
             return False
         if monitor_agent.reload_timeout <= 0:
             logger.error("MONITOR_AGENT_RELOAD_TIMEOUT 必须大于 0")
+            return False
+        if monitor_agent.backup_retention_days <= 0:
+            logger.error("MONITOR_AGENT_BACKUP_RETENTION_DAYS 必须大于 0")
             return False
 
     auth_method = "none"
