@@ -2,7 +2,7 @@
 
 import pytest
 from unittest.mock import patch, MagicMock
-from monitor_mcp_server.config import MCPServerConfig
+from monitor_mcp_server.config import DEFAULT_MCP_PATH, MCPServerConfig
 from monitor_mcp_server.client import setup_environment
 from monitor_mcp_server.tools import run_server
 
@@ -98,6 +98,49 @@ def test_mcp_server_config_requires_bind_port_for_http():
             mcp_bind_port=None,
         )
 
+
+def test_mcp_server_config_default_path():
+    """未显式传入 path 时使用默认值 /mcp。"""
+    cfg = MCPServerConfig(
+        mcp_server_transport="streamable-http",
+        mcp_bind_host="localhost",
+        mcp_bind_port=8000,
+    )
+    assert cfg.mcp_path == DEFAULT_MCP_PATH == "/mcp"
+
+
+def test_mcp_server_config_rejects_path_without_leading_slash():
+    """非 stdio 模式下 path 必须以 / 开头。"""
+    with pytest.raises(ValueError, match="PROMETHEUS_MCP_PATH 必须以 / 开头"):
+        MCPServerConfig(
+            mcp_server_transport="streamable-http",
+            mcp_bind_host="localhost",
+            mcp_bind_port=8000,
+            mcp_path="mcp/server",
+        )
+
+
+def test_mcp_server_config_accepts_empty_path_for_stdio():
+    """stdio 模式下不强制校验 path。"""
+    cfg = MCPServerConfig(
+        mcp_server_transport="stdio",
+        mcp_bind_host=None,
+        mcp_bind_port=None,
+        mcp_path="",
+    )
+    assert cfg.mcp_server_transport == "stdio"
+
+
+def test_normalize_mcp_path_handles_inputs():
+    from monitor_mcp_server.config import _normalize_mcp_path
+
+    assert _normalize_mcp_path(None) == DEFAULT_MCP_PATH
+    assert _normalize_mcp_path("") == DEFAULT_MCP_PATH
+    assert _normalize_mcp_path("/mcp/server") == "/mcp/server"
+    assert _normalize_mcp_path("mcp/server") == "/mcp/server"
+    assert _normalize_mcp_path("/mcp//server/") == "/mcp/server"
+    assert _normalize_mcp_path("  /mcp/x  ") == "/mcp/x"
+
 @patch("monitor_mcp_server.client.config")
 def test_setup_environment_with_bad_mcp_config_transport(mock_config):
     _default_mock(
@@ -122,6 +165,22 @@ def test_setup_environment_with_bad_mcp_config_port(mock_config):
             mcp_bind_host="localhost",
             mcp_bind_port="some_string",
         ),
+    )
+
+    assert setup_environment() is False
+
+
+@patch("monitor_mcp_server.client.config")
+def test_setup_environment_rejects_mcp_path_without_leading_slash(mock_config):
+    """setup_environment 也独立校验 path，绕过 dataclass __post_init__ 直接验证。"""
+    mock_mcp_config = MagicMock()
+    mock_mcp_config.mcp_server_transport = "streamable-http"
+    mock_mcp_config.mcp_bind_port = 8000
+    mock_mcp_config.mcp_path = "mcp/server"
+    _default_mock(
+        mock_config,
+        username="user", password="pass",
+        mcp_server_config=mock_mcp_config,
     )
 
     assert setup_environment() is False
@@ -168,7 +227,12 @@ def test_run_server_streamable_http_transport(mock_config, mock_run, mock_setup)
 
     run_server()
 
-    mock_run.assert_called_once_with(transport="streamable-http", host="localhost", port=8000)
+    mock_run.assert_called_once_with(
+        transport="streamable-http",
+        host="localhost",
+        port=8000,
+        path=DEFAULT_MCP_PATH,
+    )
 
 @patch("monitor_mcp_server.tools.setup_environment")
 @patch("monitor_mcp_server.tools.mcp.run")
@@ -183,7 +247,33 @@ def test_run_server_sse_transport(mock_config, mock_run, mock_setup):
 
     run_server()
 
-    mock_run.assert_called_once_with(transport="sse", host="0.0.0.0", port=9090)
+    mock_run.assert_called_once_with(
+        transport="sse",
+        host="0.0.0.0",
+        port=9090,
+        path=DEFAULT_MCP_PATH,
+    )
+
+@patch("monitor_mcp_server.tools.setup_environment")
+@patch("monitor_mcp_server.tools.mcp.run")
+@patch("monitor_mcp_server.tools.config")
+def test_run_server_passes_custom_mcp_path(mock_config, mock_run, mock_setup):
+    mock_setup.return_value = True
+    mock_config.mcp_server_config = MCPServerConfig(
+        mcp_server_transport="streamable-http",
+        mcp_bind_host="localhost",
+        mcp_bind_port=8000,
+        mcp_path="/custom/mcp",
+    )
+
+    run_server()
+
+    mock_run.assert_called_once_with(
+        transport="streamable-http",
+        host="localhost",
+        port=8000,
+        path="/custom/mcp",
+    )
 
 @patch("monitor_mcp_server.client.config")
 def test_setup_environment_invalid_url_scheme(mock_config):

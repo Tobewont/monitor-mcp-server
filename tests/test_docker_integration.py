@@ -185,7 +185,7 @@ class TestDockerContainerHTTP:
             container.reload()
             assert container.status == 'running'
             
-            # 验证端口可达即可，不强求 HTTP 200（FastMCP streamable-http 的入口在 /mcp）
+            # 验证端口可达即可，不强求 HTTP 200（FastMCP streamable-http 的入口路径由 PROMETHEUS_MCP_PATH 决定，默认 /mcp）
             try:
                 with socket.create_connection(("127.0.0.1", 8000), timeout=5):
                     pass

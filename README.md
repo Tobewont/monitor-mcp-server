@@ -47,6 +47,7 @@
 | `PROMETHEUS_MCP_SERVER_TRANSPORT` | 传输协议：`stdio` / `sse` / `streamable-http`                      |     | `stdio`      |
 | `PROMETHEUS_MCP_BIND_HOST`        | SSE / streamable-http 模式绑定地址                                  |     | `127.0.0.1`  |
 | `PROMETHEUS_MCP_BIND_PORT`        | SSE / streamable-http 模式绑定端口                                  |     | `8000`       |
+| `PROMETHEUS_MCP_PATH`             | SSE / streamable-http 模式接口路径，必须以 `/` 开头                    |     | `/mcp` |
 | `LOG_LEVEL`                       | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`                   |     | `INFO`       |
 
 
@@ -120,6 +121,7 @@ docker run --rm -p 8000:8000 \
   -e PROMETHEUS_URL=http://your-prometheus:9090 \
   -e PROMETHEUS_MCP_SERVER_TRANSPORT=streamable-http \
   -e PROMETHEUS_MCP_BIND_HOST=0.0.0.0 \
+  -e PROMETHEUS_MCP_PATH=/mcp \
   monitor-mcp-server
 
 # 带认证 + 调试日志
@@ -192,6 +194,7 @@ services:
       - PROMETHEUS_URL=http://prometheus:9090
       - PROMETHEUS_MCP_SERVER_TRANSPORT=streamable-http
       - PROMETHEUS_MCP_BIND_HOST=0.0.0.0
+      - PROMETHEUS_MCP_PATH=/mcp
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/mcp')"]

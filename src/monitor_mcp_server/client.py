@@ -425,6 +425,17 @@ def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
             )
             return False
 
+        if str(mcp_config.mcp_server_transport).lower() != TransportType.STDIO.value:
+            path = (mcp_config.mcp_path or "").strip()
+            if not path or not path.startswith("/"):
+                logger.error(
+                    "MCP 路径无效",
+                    error="PROMETHEUS_MCP_PATH 必须以 / 开头",
+                    suggestion="例如 /mcp",
+                    current_value=mcp_config.mcp_path,
+                )
+                return False
+
     monitor_agent = getattr(cfg, "monitor_agent", None)
     monitor_agent_enabled = getattr(monitor_agent, "enabled", False) is True
     if monitor_agent_enabled:
@@ -509,6 +520,8 @@ def setup_environment(active_config: Optional[PrometheusConfig] = None) -> bool:
         authentication=auth_method,
         org_id=cfg.org_id if cfg.org_id else None,
         monitor_agent_enabled=monitor_agent_enabled,
+        mcp_transport=str(cfg.mcp_server_config.mcp_server_transport).lower() if cfg.mcp_server_config else None,
+        mcp_path=cfg.mcp_server_config.mcp_path if cfg.mcp_server_config else None,
     )
 
     return True

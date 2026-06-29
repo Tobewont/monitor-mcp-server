@@ -19,7 +19,7 @@ description: 通过 Monitor MCP Server 智能查询 Prometheus / Thanos / Mimir 
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `MONITOR_MCP_SERVER_URL` | MCP Server 的访问地址（SSE 模式路径为 `/sse`，streamable-http 模式路径为 `/mcp`） | `http://monitor.example.com:8000/sse` |
+| `MONITOR_MCP_SERVER_URL` | MCP Server 的访问地址，路径需与服务端 `PROMETHEUS_MCP_PATH` 一致（默认 `/mcp`，SSE 模式如使用自定义路径需相应调整） | `http://monitor.example.com:8000/mcp` |
 | `MONITOR_MCP_SERVER_NAME` | IDE 中注册的 MCP Server 名称（方式 A 需要） | `user-monitor-mcp-server` |
 | `MONITOR_MCP_AUTH_TOKEN` | MCP Server 的认证 Token（可选，需认证时使用） | `Bearer xxxx` |
 
@@ -82,19 +82,20 @@ mcporter call '${MONITOR_MCP_SERVER_URL}.health_check()' --allow-http --header "
 
 ### 方式 C：curl 直接调用（streamable-http 模式）
 
-对于 streamable-http 传输模式，也可以通过标准 HTTP 请求调用（注意 URL 使用 streamable-http 的 `/mcp` 路径）：
+对于 streamable-http 传输模式，也可以通过标准 HTTP 请求调用（URL 路径需与服务端 `PROMETHEUS_MCP_PATH` 一致，默认 `/mcp`）：
 
 ```bash
 # 假设 MONITOR_MCP_BASE=http://localhost:8000（不含路径后缀）
+# MCP_PATH=/mcp
 
 # 健康检查
-curl -X POST ${MONITOR_MCP_BASE}/mcp \
+curl -X POST ${MONITOR_MCP_BASE}${MCP_PATH} \
   -H "Content-Type: application/json" \
   -H "Authorization: ${MONITOR_MCP_AUTH_TOKEN}" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"health_check","arguments":{}}}'
 
 # 即时查询
-curl -X POST ${MONITOR_MCP_BASE}/mcp \
+curl -X POST ${MONITOR_MCP_BASE}${MCP_PATH} \
   -H "Content-Type: application/json" \
   -H "Authorization: ${MONITOR_MCP_AUTH_TOKEN}" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_query","arguments":{"query":"up"}}}'

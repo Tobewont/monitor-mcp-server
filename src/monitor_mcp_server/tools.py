@@ -115,8 +115,14 @@ def run_server():
         logger.info("启动 Monitor MCP Server",
                     transport=transport,
                     host=mcp_config.mcp_bind_host,
-                    port=mcp_config.mcp_bind_port)
-        mcp.run(transport=transport, host=mcp_config.mcp_bind_host, port=mcp_config.mcp_bind_port)
+                    port=mcp_config.mcp_bind_port,
+                    path=mcp_config.mcp_path)
+        mcp.run(
+            transport=transport,
+            host=mcp_config.mcp_bind_host,
+            port=mcp_config.mcp_bind_port,
+            path=mcp_config.mcp_path,
+        )
     else:
         logger.info("启动 Monitor MCP Server", transport=transport)
         mcp.run(transport=transport)

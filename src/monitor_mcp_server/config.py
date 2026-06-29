@@ -20,6 +20,10 @@ MAX_LABEL_SAMPLE_SIZE = 100
 DEFAULT_MONITOR_AGENT_RELOAD_TIMEOUT = 10
 DEFAULT_MONITOR_AGENT_BACKUP_RETENTION_DAYS = 180
 
+# HTTP 传输（sse / streamable-http）暴露的接口路径。
+# 通过 PROMETHEUS_MCP_PATH 可自定义；默认 /mcp 与 FastMCP streamable-http 一致。
+DEFAULT_MCP_PATH = "/mcp"
+
 RETRY_MAX_ATTEMPTS = 3  # 最大重试次数（不含首次请求），总请求次数 = 1 + RETRY_MAX_ATTEMPTS
 RETRY_BASE_DELAY = 0.5
 RETRY_STATUS_CODES = {429, 502, 503, 504}
@@ -104,6 +108,7 @@ class MCPServerConfig:
     mcp_server_transport: Optional[str] = None
     mcp_bind_host: Optional[str] = None
     mcp_bind_port: Optional[int] = None
+    mcp_path: str = DEFAULT_MCP_PATH
 
     def __post_init__(self):
         if not self.mcp_server_transport:
@@ -113,6 +118,8 @@ class MCPServerConfig:
                 raise ValueError("PROMETHEUS_MCP_BIND_HOST 为必填项（非 stdio 模式）")
             if self.mcp_bind_port is None:
                 raise ValueError("PROMETHEUS_MCP_BIND_PORT 为必填项（非 stdio 模式）")
+            if not self.mcp_path or not self.mcp_path.startswith("/"):
+                raise ValueError("PROMETHEUS_MCP_PATH 必须以 / 开头（非 stdio 模式）")
 
 
 @dataclass
@@ -167,6 +174,19 @@ def _safe_parse_port(value: str, default: int = 8000) -> int:
         return default
 
 
+def _normalize_mcp_path(value: Optional[str]) -> str:
+    """归一化 MCP 接口路径：去掉首尾空白、补全开头的 /、去掉尾部多余的 /。"""
+    raw = (value or "").strip()
+    if not raw:
+        return DEFAULT_MCP_PATH
+    if not raw.startswith("/"):
+        raw = f"/{raw}"
+    # 折叠重复斜杠并去掉结尾斜杠（保留根路径 "/" 不被削掉）
+    parts = [part for part in raw.split("/") if part]
+    normalized = "/" + "/".join(parts)
+    return normalized or "/"
+
+
 config = PrometheusConfig(
     url=os.environ.get("PROMETHEUS_URL"),
     ruler_url=os.environ.get("RULER_URL"),
@@ -178,7 +198,8 @@ config = PrometheusConfig(
     mcp_server_config=MCPServerConfig(
         mcp_server_transport=os.environ.get("PROMETHEUS_MCP_SERVER_TRANSPORT", "stdio").lower(),
         mcp_bind_host=os.environ.get("PROMETHEUS_MCP_BIND_HOST", "127.0.0.1"),
-        mcp_bind_port=_safe_parse_port(os.environ.get("PROMETHEUS_MCP_BIND_PORT", "8000"))
+        mcp_bind_port=_safe_parse_port(os.environ.get("PROMETHEUS_MCP_BIND_PORT", "8000")),
+        mcp_path=_normalize_mcp_path(os.environ.get("PROMETHEUS_MCP_PATH")),
     ),
     monitor_agent=MonitorAgentConfig(
         enabled=_parse_bool(os.environ.get("MONITOR_AGENT_CONFIG_ENABLED"), False),

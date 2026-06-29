@@ -44,6 +44,7 @@ A Monitor MCP Server based on the [MCP (Model Context Protocol)](https://modelco
 | `PROMETHEUS_MCP_SERVER_TRANSPORT` | Transport: `stdio` / `sse` / `streamable-http` | | `stdio` |
 | `PROMETHEUS_MCP_BIND_HOST` | Bind address for SSE / streamable-http | | `127.0.0.1` |
 | `PROMETHEUS_MCP_BIND_PORT` | Bind port for SSE / streamable-http | | `8000` |
+| `PROMETHEUS_MCP_PATH` | Endpoint path for SSE / streamable-http; must start with `/` | | `/mcp` |
 | `LOG_LEVEL` | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` | | `INFO` |
 
 #### monitor-agent Config Management (optional)
@@ -111,6 +112,7 @@ docker run --rm -p 8000:8000 \
   -e PROMETHEUS_URL=http://your-prometheus:9090 \
   -e PROMETHEUS_MCP_SERVER_TRANSPORT=streamable-http \
   -e PROMETHEUS_MCP_BIND_HOST=0.0.0.0 \
+  -e PROMETHEUS_MCP_PATH=/mcp \
   monitor-mcp-server
 
 # With auth + debug logging
@@ -180,9 +182,10 @@ services:
       - PROMETHEUS_URL=http://prometheus:9090
       - PROMETHEUS_MCP_SERVER_TRANSPORT=streamable-http
       - PROMETHEUS_MCP_BIND_HOST=0.0.0.0
+      - PROMETHEUS_MCP_PATH=/mcp
     restart: unless-stopped
     healthcheck:
-      # TCP-only check; the streamable-http endpoint lives at /mcp, the root path may not respond
+      # TCP-only check; the streamable-http endpoint lives at PROMETHEUS_MCP_PATH (default /mcp), the root path may not respond
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); s.close()"]
       interval: 30s
       timeout: 10s
