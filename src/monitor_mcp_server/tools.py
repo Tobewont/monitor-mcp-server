@@ -1,6 +1,7 @@
 """MCP 工具定义与服务器启动。"""
 
 import json
+import re
 import sys
 from collections import Counter
 from typing import Any, Dict, Optional, List
@@ -532,11 +533,62 @@ def _parse_label_filters(raw: Optional[str]) -> Dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
-def _match_labels(alert_labels: Dict[str, Any], filters: Dict[str, str]) -> bool:
+_REGEX_META = set('.*+?[](){}|^$\\')
+
+
+def _compile_label_matchers(filters: Dict[str, str]) -> Dict[str, Any]:
+    """把 label_filters 预编译为匹配器，避免在循环中重复编译正则。
+
+    返回的 dict value 为以下之一：
+    - ``("exact", expected_str)``：不含正则元字符，走精确匹配
+    - ``("regex", compiled_pattern)``：含正则元字符，走 fullmatch
+    - ``("fallback", expected_str)``：正则编译失败，退化为精确匹配
+    """
+    matchers: Dict[str, Any] = {}
     for key, expected in filters.items():
+        if not any(c in expected for c in _REGEX_META):
+            matchers[key] = ("exact", expected)
+            continue
+        try:
+            # PromQL =~ 使用全匹配语义（Go regexp 会锚定为 ^(?:...)$）
+            # re.fullmatch 等价于该行为，re.search 则是部分匹配，语义不一致
+            matchers[key] = ("regex", re.compile(expected))
+        except re.error:
+            # 正则语法错误时退化为精确匹配，避免服务端 500
+            matchers[key] = ("fallback", expected)
+    return matchers
+
+
+def _match_labels(alert_labels: Dict[str, Any], matchers: Dict[str, Any]) -> bool:
+    """检查告警标签是否匹配预编译的过滤器。
+
+    匹配语义遵循 PromQL 标签匹配器规则：
+
+    - **``=~`` (正则全匹配)**：value 含正则元字符时，用 ``re.fullmatch``
+      判断是否**完整匹配**整个标签值。例如 ``"operation-.*-prod"`` 会匹配
+      ``operation-devops-prod``，但 ``"prod|dev"`` **不会**匹配
+      ``production``（因为 fullmatch 要求整个字符串匹配）。
+      这与 Prometheus 底层使用 Go ``regexp`` 的 ``^(?:pattern)$`` 锚定行为一致。
+    - **``|`` 分隔的多值匹配**：value 含 ``|`` 时会被当作正则的 alternation，
+      例如 ``"critical|warn"`` 匹配 severity **恰好**为 critical 或 warn 的告警。
+    - **``.*`` 通配**：value 为 ``.*`` 时匹配任意值（含空字符串），
+      等价于"该标签存在即可"。
+    - **精确匹配**：如果 value 不含任何正则元字符 (``.*+?[](){}|^$\\``)，
+      退化为 ``==`` 精确匹配，与旧行为完全兼容。
+
+    标签不存在时一律不匹配（与 PromQL ``{key=~"..."}`` 语义一致）。
+    """
+    for key, (mode, expected) in matchers.items():
         actual = alert_labels.get(key)
-        if actual is None or str(actual) != expected:
+        if actual is None:
             return False
+        actual_str = str(actual)
+        if mode == "exact" or mode == "fallback":
+            if actual_str != expected:
+                return False
+        elif mode == "regex":
+            if not expected.fullmatch(actual_str):
+                return False
     return True
 
 
@@ -555,11 +607,15 @@ async def get_alerts(
     Args:
         state: 状态过滤，可选 "all"（默认）/ "firing" / "pending"
         severity: 仅保留匹配该 severity 标签的条目（空字符串表示不过滤）
-        label_filters: JSON 对象字符串，按标签等值过滤。例如 '{"job":"node-agent","namespace":"prod"}'
+        label_filters: JSON 对象字符串，按标签过滤，支持 PromQL 正则语法。
+            精确匹配：'{"job":"node-agent"}'
+            正则匹配：'{"namespace":"operation-.*-prod"}'
+            多值匹配：'{"severity":"critical|warn"}'
+            通配匹配：'{"app":".*"}'（标签存在即可）
         include_annotations: 是否在明细里保留 annotations 字段（关闭可显著减少 Token 消耗）
         summary_only: True 时按 alertname 聚合，返回每条告警规则的 state/severity 分布
         page: 页码（仅在 summary_only=False 且 page_size>0 时生效）
-        page_size: 每页条数（默认 0 = 返回全部；上限 500）
+                page_size: 每页条数（默认 0 = 返回全部；上限 500）
 
     底层路由：若配置了 RULER_URL 则走 Ruler，否则走 PROMETHEUS_URL。
     """
@@ -576,6 +632,9 @@ async def get_alerts(
         filters = _parse_label_filters(label_filters)
     except ValueError as e:
         return build_error_response(str(e), error_type="client")
+
+    # 预编译正则匹配器，避免在告警循环中重复编译
+    matchers = _compile_label_matchers(filters) if filters else {}
 
     logger.info("获取告警列表",
                 state=state, severity=severity or None,
@@ -599,7 +658,7 @@ async def get_alerts(
             labels = a.get("labels") or {}
             if severity and str(labels.get("severity", "")) != severity:
                 continue
-            if filters and not _match_labels(labels, filters):
+            if matchers and not _match_labels(labels, matchers):
                 continue
             filtered.append(a)
 
